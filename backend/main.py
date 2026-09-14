@@ -49,3 +49,25 @@ def buscar_ocorrencias(conexao = Depends(conectar)):
         dicionario_busca = {"ID": id, "bloco": bloco, "andar": andar, "lado": lado, "descrição": descricao, "criado em": criado_em, "Status": status}
         resultado_busca.append(dicionario_busca)
     return resultado_busca
+
+class Status(BaseModel):
+    status: str
+
+@app.put("/Ocorrencia/{id}")
+def alterar_status(id: int, status: Status, conexao = Depends(conectar)):
+    status_validos = ["em aberto", "em andamento", "concluída", "incompleta", "resolvida"]
+    cursor = conexao.cursor()
+    cursor.execute("""SELECT * FROM ocorrencias WHERE id = ?""", (id,))
+    ocorrencia = cursor.fetchone()
+    if ocorrencia is None:
+        return {"mensagem": "Ocorrência não encontrada!"}
+    elif status.status not in status_validos:
+        return {"mensagem": "O Status não é válido"}
+    else:
+        cursor.execute("""
+            UPDATE ocorrencias
+            SET status = ?
+            WHERE id = ?
+        """, (status.status, id))
+        conexao.commit()
+        return {"mensagem": "Status alterado com sucesso"}
