@@ -8,7 +8,8 @@ def criar_tabelas(conexao):
     andar INTEGER NOT NULL,
     lado TEXT NOT NULL,
     descricao TEXT NOT NULL,
-    criado_em TEXT NOT NULL
+    criado_em TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT "em aberto"
     )""")
 
     conexao.commit()

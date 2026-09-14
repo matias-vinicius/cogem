@@ -45,7 +45,7 @@ def buscar_ocorrencias(conexao = Depends(conectar)):
     ocorrencias = cursor.fetchall()
     resultado_busca = []
     for ocorrencia in ocorrencias:
-        id, bloco, andar, lado, descricao, criado_em = ocorrencia
-        dicionario_busca = {"ID": id, "bloco": bloco, "andar": andar, "lado": lado, "descrição": descricao, "criado em": criado_em}
+        id, bloco, andar, lado, descricao, criado_em, status = ocorrencia
+        dicionario_busca = {"ID": id, "bloco": bloco, "andar": andar, "lado": lado, "descrição": descricao, "criado em": criado_em, "Status": status}
         resultado_busca.append(dicionario_busca)
     return resultado_busca
