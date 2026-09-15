@@ -9,7 +9,8 @@ def criar_tabelas(conexao):
     lado TEXT NOT NULL,
     descricao TEXT NOT NULL,
     criado_em TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT "em aberto"
+    status TEXT NOT NULL DEFAULT "em aberto",
+    tipo TEXT NOT NULL DEFAULT "comum"
     )""")
 
     conexao.commit()

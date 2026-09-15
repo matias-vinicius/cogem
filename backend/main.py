@@ -18,19 +18,22 @@ class Ocorrencia(BaseModel):
     andar: int
     lado: str
     descricao: str
+    tipo: str = "comum"
 
 @app.post("/Ocorrencia")
 def registrar_ocorrencia(ocorrencia: Ocorrencia, conexao = Depends(conectar)):
-    # print(f"Ocorrência registrada no bloco: {ocorrencia.bloco}, Andar {ocorrencia.andar}, Lado {ocorrencia.lado}.")
-    # print(f"Descrição: {ocorrencia.descricao}")
-    # return ocorrencia
     agora = datetime.now()
     criado_em = agora.strftime("%Y-%m-%d %H:%M:%S")
     cursor = conexao.cursor()
-    cursor.execute("""
-        INSERT INTO ocorrencias(bloco, andar, lado, descricao, criado_em) 
-        VALUES (?, ?, ?, ?, ?)
-""", (ocorrencia.bloco, ocorrencia.andar, ocorrencia.lado, ocorrencia.descricao, criado_em))
+    tipos_validos = ["comum", "urgente"]
+    tipo = ocorrencia.tipo.lower()
+    if tipo not in tipos_validos:
+        return {"mensagem": "Tipo inválido!"}
+    else:
+        cursor.execute("""
+            INSERT INTO ocorrencias(bloco, andar, lado, descricao, criado_em, tipo) 
+            VALUES (?, ?, ?, ?, ?, ?)
+    """, (ocorrencia.bloco, ocorrencia.andar, ocorrencia.lado, ocorrencia.descricao, criado_em, tipo))
     conexao.commit()
 
     id_ocorrencia = cursor.lastrowid
@@ -45,8 +48,8 @@ def buscar_ocorrencias(conexao = Depends(conectar)):
     ocorrencias = cursor.fetchall()
     resultado_busca = []
     for ocorrencia in ocorrencias:
-        id, bloco, andar, lado, descricao, criado_em, status = ocorrencia
-        dicionario_busca = {"ID": id, "bloco": bloco, "andar": andar, "lado": lado, "descrição": descricao, "criado em": criado_em, "Status": status}
+        id, bloco, andar, lado, descricao, criado_em, status, tipo = ocorrencia
+        dicionario_busca = {"ID": id, "bloco": bloco, "andar": andar, "lado": lado, "descrição": descricao, "criado em": criado_em, "Status": status, "Tipo": tipo}
         resultado_busca.append(dicionario_busca)
     return resultado_busca
 
