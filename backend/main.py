@@ -1,10 +1,12 @@
-from fastapi import FastAPI, Depends
+import sqlite3
+from pathlib import Path
+from fastapi import FastAPI, Depends, HTTPException
 from pydantic import BaseModel
 from database.connection import conectar
 from database.tables import criar_tabelas
 from datetime import datetime
 
-conexao = conectar()
+conexao = sqlite3.connect(Path(__file__).resolve().parents[1] / "database" / "cogem.db")
 criar_tabelas(conexao)
 
 app = FastAPI()
@@ -28,7 +30,10 @@ def registrar_ocorrencia(ocorrencia: Ocorrencia, conexao = Depends(conectar)):
     tipos_validos = ["comum", "urgente"]
     tipo = ocorrencia.tipo.lower()
     if tipo not in tipos_validos:
-        return {"mensagem": "Tipo inválido!"}
+        raise HTTPException(
+            status_code=400,
+            detail="Tipo inválido!"
+        )
     else:
         cursor.execute("""
             INSERT INTO ocorrencias(bloco, andar, lado, descricao, criado_em, tipo) 
@@ -56,23 +61,6 @@ def buscar_ocorrencias(conexao = Depends(conectar)):
 class Status(BaseModel):
     status: str
 
-# def alterar_status(id: int, status: Status, conexao = Depends(conectar)):
-#     status_validos = ["em aberto", "em andamento", "concluída", "em análise", "resolvida"]
-#     cursor = conexao.cursor()
-#     cursor.execute("""SELECT * FROM ocorrencias WHERE id = ?""", (id,))
-#     ocorrencia = cursor.fetchone()
-#     if ocorrencia is None:
-#         return {"mensagem": "Ocorrência não encontrada!"}
-#     elif status.status not in status_validos:
-#         return {"mensagem": "O Status não é válido"}
-#     else:
-#         cursor.execute("""
-#             UPDATE ocorrencias
-#             SET status = ?
-#             WHERE id = ?
-#         """, (status.status, id))
-#         conexao.commit()
-#         return {"mensagem": "Status alterado com sucesso"}
 @app.put("/Ocorrencia/{id}/iniciar")
 def iniciar_tarefa(id: int, conexao = Depends(conectar)):
     cursor = conexao.cursor()
@@ -81,7 +69,10 @@ def iniciar_tarefa(id: int, conexao = Depends(conectar)):
     ocorrencia = cursor.fetchone()
 
     if ocorrencia is None:
-        return {"mensagem": "Ocorrência não encontrada"}
+        raise HTTPException(
+            status_code=404,
+            detail="Ocorrência não encontrada!"
+        )
     elif ocorrencia[6] == "em aberto":
         cursor.execute("""
                 UPDATE ocorrencias
@@ -91,4 +82,38 @@ def iniciar_tarefa(id: int, conexao = Depends(conectar)):
         conexao.commit()
         return {"mensagem": "Ocorrência iniciada!"}
     else:
-        return {"mensagem": "Tarefa já iniciada"}
+        raise HTTPException(
+            status_code=400,
+            detail="Tarefa já iniciada!"
+        )
+
+@app.put("/Ocorrencia/{id}/finalizar")
+def finalizar_tarefa(id: int, conexao = Depends(conectar)):
+    cursor = conexao.cursor()
+
+    cursor.execute("""SELECT * FROM ocorrencias WHERE id = ?""", (id,))
+    ocorrencia = cursor.fetchone()
+
+    if ocorrencia is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Ocorrência não encontrada!"
+            )
+    
+    elif ocorrencia[6] == "em andamento" or ocorrencia[6] == "em análise":
+        cursor.execute("""
+                UPDATE ocorrencias
+                SET status = "concluída"
+                WHERE id = ?
+                """, (id,))
+        conexao.commit()
+        return {"mensagem": "Ocorrência finalizada!"}
+    
+    elif ocorrencia[6] == "em aberto":
+        raise HTTPException(
+            status_code=400,
+            detail="A tarefa não foi iniciada!"
+        )
+    
+    else:
+        return {"mensagem": "Tarefa já finalizada"}
