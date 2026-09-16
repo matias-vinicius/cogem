@@ -6,4 +6,8 @@ database = raiz / "database"
 
 def conectar():
     conexao = sqlite3.connect(database / "cogem.db")
-    return conexao
+
+    try:
+        yield conexao
+    finally:
+        conexao.close()

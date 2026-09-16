@@ -56,21 +56,39 @@ def buscar_ocorrencias(conexao = Depends(conectar)):
 class Status(BaseModel):
     status: str
 
-@app.put("/Ocorrencia/{id}")
-def alterar_status(id: int, status: Status, conexao = Depends(conectar)):
-    status_validos = ["em aberto", "em andamento", "concluída", "incompleta", "resolvida"]
+# def alterar_status(id: int, status: Status, conexao = Depends(conectar)):
+#     status_validos = ["em aberto", "em andamento", "concluída", "em análise", "resolvida"]
+#     cursor = conexao.cursor()
+#     cursor.execute("""SELECT * FROM ocorrencias WHERE id = ?""", (id,))
+#     ocorrencia = cursor.fetchone()
+#     if ocorrencia is None:
+#         return {"mensagem": "Ocorrência não encontrada!"}
+#     elif status.status not in status_validos:
+#         return {"mensagem": "O Status não é válido"}
+#     else:
+#         cursor.execute("""
+#             UPDATE ocorrencias
+#             SET status = ?
+#             WHERE id = ?
+#         """, (status.status, id))
+#         conexao.commit()
+#         return {"mensagem": "Status alterado com sucesso"}
+@app.put("/Ocorrencia/{id}/iniciar")
+def iniciar_tarefa(id: int, conexao = Depends(conectar)):
     cursor = conexao.cursor()
+
     cursor.execute("""SELECT * FROM ocorrencias WHERE id = ?""", (id,))
     ocorrencia = cursor.fetchone()
+
     if ocorrencia is None:
-        return {"mensagem": "Ocorrência não encontrada!"}
-    elif status.status not in status_validos:
-        return {"mensagem": "O Status não é válido"}
-    else:
+        return {"mensagem": "Ocorrência não encontrada"}
+    elif ocorrencia[6] == "em aberto":
         cursor.execute("""
-            UPDATE ocorrencias
-            SET status = ?
-            WHERE id = ?
-        """, (status.status, id))
+                UPDATE ocorrencias
+                SET status = "em andamento"
+                WHERE id = ?
+                """, (id,))
         conexao.commit()
-        return {"mensagem": "Status alterado com sucesso"}
+        return {"mensagem": "Ocorrência iniciada!"}
+    else:
+        return {"mensagem": "Tarefa já iniciada"}
