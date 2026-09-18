@@ -1,4 +1,4 @@
-import { ArrowLeft, Check, ImagePlus, X } from 'lucide-react'
+import { ArrowLeft, Check, CircleDot, ImagePlus, Info, X } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import PageHeader from '../components/PageHeader'
@@ -42,6 +42,7 @@ export default function NewOccurrencePage() {
       <PageHeader title="Nova ocorrência" description="Preencha os dados para registrar uma nova ocorrência." />
 
       <form className="form-card" onSubmit={submit}>
+        <div className="creation-status-note"><span><CircleDot size={18} /></span><div><strong>Status inicial: Em aberto</strong><p>Toda nova ocorrência inicia automaticamente aguardando atendimento.</p></div><Info size={18} /></div>
         <div className="form-grid">
           <label><span>Bloco *</span><select name="bloco" value={form.bloco} onChange={change}><option>A</option><option>B</option><option>C</option><option>D</option></select></label>
           <label><span>Andar *</span><input name="andar" type="number" min="0" max="99" value={form.andar} onChange={change} /></label>
