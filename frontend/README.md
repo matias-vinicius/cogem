@@ -1,5 +1,20 @@
 # COGEM Frontend
 
+Interface responsiva para gestão de ocorrências em condomínios.
+
+## Fluxo de status
+
+- Toda nova ocorrência é criada automaticamente como `em aberto`.
+- Comum: `em aberto` → `em andamento` → `concluída` ou `incompleta`.
+- Urgente: `em aberto` → `em andamento` → `resolvida`.
+- Uma ocorrência incompleta pode voltar para `em andamento`.
+
+O frontend limita as opções exibidas. Para segurança total, o backend também deve validar essas transições.
+
+## Configurações
+
+Perfil, notificações e registros locais são persistidos no `localStorage` do navegador. Para compartilhar esses dados entre computadores e usuários, será necessário criar as respectivas rotas e tabelas no backend.
+
 Frontend responsivo do sistema de Gestão de Ocorrências em Condomínios.
 
 ## Executar

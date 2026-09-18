@@ -12,6 +12,7 @@ import {
 import { useState } from 'react'
 import { NavLink, useLocation } from 'react-router-dom'
 import { useOccurrences } from '../context/OccurrencesContext'
+import { useSettings } from '../context/SettingsContext'
 
 const navItems = [
   { to: '/', label: 'Início', icon: Home, end: true },
@@ -32,6 +33,7 @@ function Logo() {
 export default function AppShell({ children }) {
   const [menuOpen, setMenuOpen] = useState(false)
   const { apiError } = useOccurrences()
+  const { profile } = useSettings()
   const location = useLocation()
 
   function closeMenu() {
@@ -44,7 +46,7 @@ export default function AppShell({ children }) {
         <Logo />
         <div className="topbar-actions">
           {apiError && <span className="demo-pill error">API desconectada</span>}
-          <div className="profile-chip"><CircleUserRound size={20} /><span>Administrador</span></div>
+          <div className="profile-chip"><CircleUserRound size={20} /><span>{profile.name}</span></div>
           <button className="icon-button mobile-menu-button" onClick={() => setMenuOpen((value) => !value)} aria-label="Abrir menu">
             {menuOpen ? <X /> : <Menu />}
           </button>
