@@ -1,23 +1,23 @@
-import { Bell, ChevronRight, CircleHelp, CircleUserRound, Database, Info, ShieldCheck } from 'lucide-react'
+import { Bell, Building2, Check, Database, Info, RotateCcw, ShieldCheck } from 'lucide-react'
+import { useState } from 'react'
 import PageHeader from '../components/PageHeader'
-import { useOccurrences } from '../context/OccurrencesContext'
+import { useData } from '../context/DataContext'
 
 export default function SettingsPage() {
-  const { apiError } = useOccurrences()
-  const options = [
-    { icon: CircleUserRound, title: 'Perfil', description: 'Dados do administrador' },
-    { icon: Bell, title: 'Notificações', description: 'Preferências de avisos' },
-    { icon: ShieldCheck, title: 'Regras de status', description: 'Fluxos de ocorrências comuns e urgentes' },
-    { icon: CircleHelp, title: 'Ajuda', description: 'Orientações de uso do sistema' },
-    { icon: Info, title: 'Sobre o COGEM', description: 'Versão 0.1.0' },
-  ]
-
-  return (
-    <div className="page settings-page">
-      <PageHeader eyebrow="Sistema" title="Configurações" description="Gerencie preferências e consulte informações do COGEM." />
-      <section className="profile-card"><div className="avatar"><CircleUserRound size={42} /></div><div><h2>Administrador</h2><p>admin@cogem.com</p></div><span className={`connection-status ${apiError ? 'offline' : ''}`}><Database size={16} />{apiError ? 'API desconectada' : 'API conectada'}</span></section>
-      <section className="settings-list">{options.map(({ icon: Icon, title, description }) => <button key={title}><span className="settings-icon"><Icon size={20} /></span><span><strong>{title}</strong><small>{description}</small></span><ChevronRight size={18} /></button>)}</section>
-      <section className="brand-footer-card"><div className="brand-mark"><Database size={26} /></div><div><strong>COGEM</strong><p>Mais organização para o seu condomínio.</p></div></section>
-    </div>
-  )
+  const { settings, saveSettings, resetDemo } = useData()
+  const [form, setForm] = useState(settings)
+  const [saved, setSaved] = useState(false)
+  const [confirmReset, setConfirmReset] = useState(false)
+  function change(event) { const { name, value, checked, type } = event.target; setForm((current) => ({ ...current, [name]: type === 'checkbox' ? checked : value })) }
+  function submit(event) { event.preventDefault(); saveSettings(form); setSaved(true); setTimeout(() => setSaved(false), 2500) }
+  function reset() { resetDemo(); setForm(settings); setConfirmReset(false); window.location.reload() }
+  return <div className="page settings-page"><PageHeader eyebrow="Administração" title="Configurações" description="Personalize os dados e o comportamento do COGEM." />
+    <form onSubmit={submit} className="settings-grid">
+      <section className="panel settings-section"><header><span><Building2 size={20} /></span><div><h2>Dados do condomínio</h2><p>Informações exibidas em telas e relatórios.</p></div></header><div className="form-layout"><label className="span-2"><span>Nome do condomínio</span><input name="condominiumName" value={form.condominiumName} onChange={change} /></label><label><span>CNPJ/Documento</span><input name="document" value={form.document} onChange={change} /></label><label><span>Cidade/Endereço</span><input name="address" value={form.address} onChange={change} /></label></div></section>
+      <section className="panel settings-section"><header><span><Bell size={20} /></span><div><h2>Notificações</h2><p>Escolha quais eventos geram alertas.</p></div></header><div className="settings-toggles"><label><span><strong>Encomendas</strong><small>Avisar sobre novos volumes recebidos.</small></span><input type="checkbox" name="packageNotifications" checked={form.packageNotifications} onChange={change} /></label><label><span><strong>Visitantes</strong><small>Avisar entradas e saídas registradas.</small></span><input type="checkbox" name="visitorNotifications" checked={form.visitorNotifications} onChange={change} /></label><label><span><strong>Ocorrências</strong><small>Avisar novas solicitações urgentes.</small></span><input type="checkbox" name="occurrenceNotifications" checked={form.occurrenceNotifications} onChange={change} /></label></div></section>
+      <section className="panel settings-section"><header><span><ShieldCheck size={20} /></span><div><h2>Segurança e integração</h2><p>Status dos recursos que dependem do backend.</p></div></header><div className="integration-list"><div><Database size={18} /><span><strong>Modo de dados</strong><small>Dados locais demonstrativos</small></span><b className="status-dot warning">local</b></div><div><ShieldCheck size={18} /><span><strong>Permissões</strong><small>Interface preparada por função</small></span><b className="status-dot success">ativa</b></div><div><Info size={18} /><span><strong>API Python</strong><small>Contrato disponível na documentação</small></span><b className="status-dot neutral">pendente</b></div></div></section>
+      <section className="panel settings-section danger-section"><header><span><RotateCcw size={20} /></span><div><h2>Dados de demonstração</h2><p>Restaure os exemplos originais do frontend.</p></div></header>{confirmReset ? <div className="reset-confirm"><p>Todos os cadastros feitos localmente serão apagados. Deseja continuar?</p><div><button type="button" className="button secondary" onClick={() => setConfirmReset(false)}>Cancelar</button><button type="button" className="button danger" onClick={reset}>Sim, restaurar</button></div></div> : <button type="button" className="button danger-outline" onClick={() => setConfirmReset(true)}><RotateCcw size={16} />Restaurar dados iniciais</button>}</section>
+      <footer className="settings-actions">{saved && <span><Check size={17} />Configurações salvas</span>}<button className="button primary"><Check size={17} />Salvar configurações</button></footer>
+    </form>
+  </div>
 }
