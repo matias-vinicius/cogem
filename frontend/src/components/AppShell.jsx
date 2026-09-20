@@ -1,80 +1,72 @@
 import {
-  Building2,
-  CircleUserRound,
-  ClipboardList,
-  Home,
-  LogOut,
-  Menu,
-  Plus,
-  Settings,
-  X,
+  Bell, BookOpenText, Boxes, Building2, CalendarDays, ChevronDown, ClipboardList,
+  DoorOpen, HelpCircle, Home, KeyRound, LogOut, Menu, Package, Settings, ShieldCheck, UserRound, Users, X,
 } from 'lucide-react'
-import { useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { NavLink, useLocation } from 'react-router-dom'
-import { useOccurrences } from '../context/OccurrencesContext'
-import { useSettings } from '../context/SettingsContext'
+import { canAccess, ROLE_LABELS } from '../config/permissions'
+import { useAuth } from '../context/AuthContext'
+import { useData } from '../context/DataContext'
 
-const navItems = [
-  { to: '/', label: 'Início', icon: Home, end: true },
-  { to: '/ocorrencias', label: 'Ocorrências', icon: ClipboardList },
-  { to: '/ocorrencias/nova', label: 'Nova ocorrência', icon: Plus },
-  { to: '/configuracoes', label: 'Configurações', icon: Settings },
+const navigation = [
+  { label: 'Visão geral', items: [{ to: '/', label: 'Início', icon: Home, module: 'dashboard', end: true }] },
+  { label: 'Operação', items: [
+    { to: '/ocorrencias', label: 'Ocorrências', icon: ClipboardList, module: 'occurrences' },
+    { to: '/encomendas', label: 'Encomendas', icon: Package, module: 'packages' },
+    { to: '/livro-portaria', label: 'Livro da portaria', icon: BookOpenText, module: 'logbook' },
+    { to: '/chaves', label: 'Chaves', icon: KeyRound, module: 'keys' },
+    { to: '/visitantes', label: 'Visitantes', icon: Users, module: 'visitors' },
+    { to: '/controle-acesso', label: 'Controle de acesso', icon: DoorOpen, module: 'access' },
+  ] },
+  { label: 'Gestão', items: [
+    { to: '/estoque', label: 'Estoque', icon: Boxes, module: 'inventory' },
+    { to: '/reservas', label: 'Reservas e eventos', icon: CalendarDays, module: 'events' },
+    { to: '/usuarios', label: 'Usuários e acessos', icon: ShieldCheck, module: 'users' },
+    { to: '/configuracoes', label: 'Configurações', icon: Settings, module: 'settings' },
+  ] },
 ]
 
-function Logo() {
-  return (
-    <div className="brand">
-      <span className="brand-mark"><Building2 size={26} /></span>
-      <span><strong>COGEM</strong><small>Gestão de Ocorrências em Condomínios</small></span>
-    </div>
-  )
-}
-
 export default function AppShell({ children }) {
+  const { user, logout } = useAuth()
+  const { packages, visitors, occurrences } = useData()
   const [menuOpen, setMenuOpen] = useState(false)
-  const { apiError } = useOccurrences()
-  const { profile } = useSettings()
+  const [profileOpen, setProfileOpen] = useState(false)
+  const [notificationOpen, setNotificationOpen] = useState(false)
   const location = useLocation()
 
-  function closeMenu() {
-    setMenuOpen(false)
-  }
+  useEffect(() => { setMenuOpen(false); setProfileOpen(false); setNotificationOpen(false) }, [location.pathname])
+
+  const alerts = useMemo(() => (
+    packages.filter((item) => item.status === 'aguardando retirada').length +
+    visitors.filter((item) => item.status === 'dentro').length +
+    occurrences.filter((item) => item.status === 'em aberto').length
+  ), [packages, visitors, occurrences])
+
+  const visibleGroups = navigation.map((group) => ({ ...group, items: group.items.filter((item) => canAccess(user.role, item.module)) })).filter((group) => group.items.length)
 
   return (
     <div className="app-shell">
       <header className="topbar">
-        <Logo />
+        <button className="mobile-menu-button" onClick={() => setMenuOpen(true)} aria-label="Abrir menu"><Menu size={22} /></button>
+        <div className="topbar-context"><span className="topbar-property"><Building2 size={17} />Residencial COGEM</span></div>
         <div className="topbar-actions">
-          {apiError && <span className="demo-pill error">API desconectada</span>}
-          <div className="profile-chip"><CircleUserRound size={20} /><span>{profile.name}</span></div>
-          <button className="icon-button mobile-menu-button" onClick={() => setMenuOpen((value) => !value)} aria-label="Abrir menu">
-            {menuOpen ? <X /> : <Menu />}
-          </button>
+          <div className="notification-menu"><button className="notification-button" onClick={() => { setNotificationOpen((value) => !value); setProfileOpen(false) }} aria-label={`${alerts} alertas`}><Bell size={19} />{alerts > 0 && <span>{alerts > 9 ? '9+' : alerts}</span>}</button>{notificationOpen && <div className="notification-dropdown"><header><strong>Central de alertas</strong><small>{alerts} pendência(s)</small></header>{canAccess(user.role, 'packages') && <NavLink to="/encomendas"><Package size={17} /><span><strong>Encomendas</strong><small>{packages.filter((item) => item.status === 'aguardando retirada').length} aguardando retirada</small></span></NavLink>}{canAccess(user.role, 'visitors') && <NavLink to="/visitantes"><Users size={17} /><span><strong>Visitantes</strong><small>{visitors.filter((item) => item.status === 'dentro').length} dentro do condomínio</small></span></NavLink>}{canAccess(user.role, 'occurrences') && <NavLink to="/ocorrencias"><ClipboardList size={17} /><span><strong>Ocorrências</strong><small>{occurrences.filter((item) => item.status === 'em aberto').length} em aberto</small></span></NavLink>}</div>}</div>
+          <div className="profile-menu">
+            <button className="profile-trigger" onClick={() => { setProfileOpen((value) => !value); setNotificationOpen(false) }}><span className="avatar-small">{user.name.charAt(0)}</span><span><strong>{user.name}</strong><small>{ROLE_LABELS[user.role]}</small></span><ChevronDown size={15} /></button>
+            {profileOpen && <div className="profile-dropdown"><div><strong>{user.email}</strong><small>{user.unit}</small></div><NavLink to="/perfil"><UserRound size={16} />Meu perfil</NavLink><NavLink to="/ajuda"><HelpCircle size={16} />Ajuda e suporte</NavLink><button onClick={logout}><LogOut size={16} />Sair do sistema</button></div>}
+          </div>
         </div>
       </header>
 
       <aside className={`sidebar ${menuOpen ? 'is-open' : ''}`}>
-        <nav aria-label="Navegação principal">
-          {navItems.map(({ to, label, icon: Icon, end }) => (
-            <NavLink key={to} to={to} end={end} onClick={closeMenu} className={({ isActive }) => (isActive ? 'active' : '')}>
-              <Icon size={19} /><span>{label}</span>
-            </NavLink>
-          ))}
+        <div className="sidebar-brand"><span className="brand-mark"><Building2 size={27} /></span><span><strong>COGEM</strong><small>Gestão condominial</small></span><button className="sidebar-close" onClick={() => setMenuOpen(false)}><X size={20} /></button></div>
+        <nav className="sidebar-nav">
+          {visibleGroups.map((group) => <div className="nav-group" key={group.label}><span className="nav-label">{group.label}</span>{group.items.map(({ to, label, icon: Icon, end }) => <NavLink key={to} to={to} end={end} className={({ isActive }) => isActive ? 'active' : ''}><Icon size={18} /><span>{label}</span>{to === '/encomendas' && packages.filter((item) => item.status === 'aguardando retirada').length > 0 && <b>{packages.filter((item) => item.status === 'aguardando retirada').length}</b>}</NavLink>)}</div>)}
         </nav>
-        <button className="sidebar-logout"><LogOut size={19} />Sair</button>
+        <div className="sidebar-footer"><span className="system-status"><i />Sistema operacional</span><small>COGEM v1.0</small></div>
       </aside>
-
-      {menuOpen && <button className="menu-backdrop" onClick={closeMenu} aria-label="Fechar menu" />}
-
-      <main key={location.pathname} className="page-content">{children}</main>
-
-      <nav className="bottom-nav" aria-label="Navegação móvel">
-        {navItems.filter((item) => item.to !== '/ocorrencias/nova').map(({ to, label, icon: Icon, end }) => (
-          <NavLink key={to} to={to} end={end} className={({ isActive }) => (isActive ? 'active' : '')}>
-            <Icon size={20} /><span>{label}</span>
-          </NavLink>
-        ))}
-      </nav>
+      {menuOpen && <button className="sidebar-backdrop" onClick={() => setMenuOpen(false)} aria-label="Fechar menu" />}
+      <main className="page-content">{children}</main>
     </div>
   )
 }

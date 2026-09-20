@@ -1,21 +1,18 @@
-import { CircleHelp, ExternalLink } from 'lucide-react'
+import { BookOpenText, Boxes, ClipboardList, HelpCircle, KeyRound, Mail, Package, Phone, ShieldCheck, Users } from 'lucide-react'
 import PageHeader from '../components/PageHeader'
-import SettingsBackLink from '../components/SettingsBackLink'
 
-const questions = [
-  ['Como cadastrar uma ocorrência?', 'Abra “Nova ocorrência”, informe bloco, andar, lado, tipo e descrição. Ao cadastrar, ela será criada automaticamente com o status “em aberto”.'],
-  ['Como iniciar um atendimento?', 'Abra a ocorrência na lista, clique em “Alterar status” e avance de “em aberto” para “em andamento”.'],
-  ['Como finalizar uma ocorrência?', 'Depois que estiver “em andamento”, altere para “concluída” em ocorrências comuns ou “resolvida” em ocorrências urgentes.'],
-  ['Por que não consigo escolher qualquer status?', 'O COGEM bloqueia mudanças fora da ordem para manter o histórico e o processo de atendimento corretos.'],
-  ['Por que aparece “API desconectada”?', 'Confirme se o backend está executando em http://127.0.0.1:8000 e depois atualize a página.'],
+const topics = [
+  { icon: ClipboardList, title: 'Ocorrências', text: 'Cadastre uma solicitação. Ela nasce em aberto e segue o fluxo definido pelo tipo.' },
+  { icon: Package, title: 'Encomendas', text: 'Registre o recebimento e confirme quem retirou o volume na portaria.' },
+  { icon: Users, title: 'Visitantes', text: 'Autorize a pessoa e use os botões de entrada e saída para manter o acesso atualizado.' },
+  { icon: KeyRound, title: 'Chaves', text: 'Controle o responsável, finalidade, retirada e devolução de cada chave.' },
+  { icon: Boxes, title: 'Estoque', text: 'Cadastre materiais e faça entradas ou baixas com motivo registrado.' },
+  { icon: ShieldCheck, title: 'Perfis', text: 'Cada função visualiza apenas os módulos previstos na matriz de acesso.' },
 ]
 
 export default function HelpPage() {
-  return (
-    <div className="page settings-subpage">
-      <SettingsBackLink />
-      <PageHeader eyebrow="Suporte" title="Central de ajuda" description="Respostas rápidas para utilizar o COGEM." />
-      <section className="help-card"><div className="settings-form-heading"><span className="settings-hero-icon"><CircleHelp size={26} /></span><div><strong>Perguntas frequentes</strong><p>Clique em uma pergunta para visualizar a resposta.</p></div></div><div className="faq-list">{questions.map(([question, answer], index) => <details key={question} open={index === 0}><summary>{question}<ExternalLink size={16} /></summary><p>{answer}</p></details>)}</div></section>
-    </div>
-  )
+  return <div className="page"><PageHeader back eyebrow="Suporte" title="Central de ajuda" description="Orientações rápidas para operar o COGEM." />
+    <section className="help-grid">{topics.map(({ icon: Icon, title, text }) => <article className="panel help-card" key={title}><span><Icon size={21} /></span><h2>{title}</h2><p>{text}</p></article>)}</section>
+    <section className="panel support-card"><div><span className="support-icon"><HelpCircle size={24} /></span><div><span className="eyebrow">Precisa de apoio?</span><h2>Fale com a administração</h2><p>Use os canais internos do condomínio para dúvidas, cadastros e acessos.</p></div></div><div><a href="mailto:admin@cogem.com"><Mail size={17} />admin@cogem.com</a><a href="tel:+551140000000"><Phone size={17} />(11) 4000-0000</a><a href="mailto:admin@cogem.com?subject=Suporte%20COGEM"><BookOpenText size={17} />Abrir chamado</a></div></section>
+  </div>
 }

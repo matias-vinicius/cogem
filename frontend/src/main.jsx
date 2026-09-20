@@ -2,18 +2,18 @@ import React from 'react'
 import ReactDOM from 'react-dom/client'
 import { BrowserRouter } from 'react-router-dom'
 import App from './App'
-import { OccurrencesProvider } from './context/OccurrencesContext'
-import { SettingsProvider } from './context/SettingsContext'
+import { AuthProvider } from './context/AuthContext'
+import { DataProvider } from './context/DataContext'
 import './styles/global.css'
 
 ReactDOM.createRoot(document.getElementById('root')).render(
   <React.StrictMode>
     <BrowserRouter>
-      <SettingsProvider>
-        <OccurrencesProvider>
+      <AuthProvider>
+        <DataProvider>
           <App />
-        </OccurrencesProvider>
-      </SettingsProvider>
+        </DataProvider>
+      </AuthProvider>
     </BrowserRouter>
   </React.StrictMode>,
 )

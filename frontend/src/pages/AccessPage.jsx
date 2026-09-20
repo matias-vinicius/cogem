@@ -1,0 +1,24 @@
+import { ArrowDownLeft, ArrowUpRight, DoorOpen, Plus, ShieldCheck } from 'lucide-react'
+import { useMemo, useState } from 'react'
+import Badge from '../components/Badge'
+import EmptyState from '../components/EmptyState'
+import Modal from '../components/Modal'
+import PageHeader from '../components/PageHeader'
+import SearchField from '../components/SearchField'
+import { useData } from '../context/DataContext'
+
+function formatDate(value) { return new Intl.DateTimeFormat('pt-BR', { dateStyle: 'short', timeStyle: 'medium' }).format(new Date(value)) }
+
+export default function AccessPage() {
+  const { accessLogs, visitors, registerManualAccess } = useData()
+  const [search, setSearch] = useState('')
+  const [direction, setDirection] = useState('todas')
+  const [open, setOpen] = useState(false)
+  const filtered = useMemo(() => accessLogs.filter((item) => (direction === 'todas' || item.direction === direction) && `${item.person} ${item.unit} ${item.kind} ${item.registeredBy}`.toLowerCase().includes(search.toLowerCase())), [accessLogs, search, direction])
+  function submit(event) { event.preventDefault(); registerManualAccess(Object.fromEntries(new FormData(event.currentTarget).entries())); setOpen(false) }
+  return <div className="page"><PageHeader eyebrow="Segurança" title="Controle de acesso" description="Monitore entradas e saídas registradas pela portaria." action={<button className="button primary" onClick={() => setOpen(true)}><Plus size={17} />Registro manual</button>} />
+    <section className="mini-stats"><div><DoorOpen /><span>Pessoas no local<strong>{visitors.filter((item) => item.status === 'dentro').length}</strong></span></div><div><ArrowDownLeft /><span>Entradas hoje<strong>{accessLogs.filter((item) => item.direction === 'entrada' && new Date(item.createdAt).toDateString() === new Date().toDateString()).length}</strong></span></div><div><ArrowUpRight /><span>Saídas hoje<strong>{accessLogs.filter((item) => item.direction === 'saída' && new Date(item.createdAt).toDateString() === new Date().toDateString()).length}</strong></span></div></section>
+    <section className="panel list-panel"><div className="filters-row"><SearchField value={search} onChange={setSearch} placeholder="Buscar pessoa, unidade ou operador..." /><select value={direction} onChange={(event) => setDirection(event.target.value)}><option value="todas">Entradas e saídas</option><option value="entrada">Entradas</option><option value="saída">Saídas</option></select></div>{filtered.length === 0 ? <EmptyState icon={ShieldCheck} /> : <div className="access-timeline">{filtered.map((item) => <article key={item.id}><span className={`access-icon access-${item.direction}`}>{item.direction === 'entrada' ? <ArrowDownLeft /> : <ArrowUpRight />}</span><div><header><strong>{item.person}</strong><Badge>{item.direction}</Badge></header><p>{item.kind} · destino {item.unit}</p><small>Autorizado por {item.authorizedBy || 'Portaria'} · registrado por {item.registeredBy}</small></div><time>{formatDate(item.createdAt)}</time></article>)}</div>}</section>
+    <Modal open={open} onClose={() => setOpen(false)} title="Registro manual de acesso" description="Use para moradores, prestadores ou acessos sem autorização prévia."><form className="form-layout" onSubmit={submit}><label><span>Nome da pessoa *</span><input name="person" required /></label><label><span>Unidade/destino *</span><input name="unit" required /></label><label><span>Tipo *</span><select name="kind"><option>Morador</option><option>Visitante</option><option>Prestador</option><option>Entregador</option><option>Funcionário</option></select></label><label><span>Movimento *</span><select name="direction"><option value="entrada">Entrada</option><option value="saída">Saída</option></select></label><label className="span-2"><span>Responsável pela autorização</span><input name="authorizedBy" placeholder="Morador ou administração" /></label><div className="modal-actions span-2"><button type="button" className="button secondary" onClick={() => setOpen(false)}>Cancelar</button><button className="button primary">Registrar acesso</button></div></form></Modal>
+  </div>
+}
