@@ -492,7 +492,6 @@ def finalizar_tarefa(id: int, conexao=Depends(get_db)):
     return {"mensagem": "Tarefa já finalizada"}
 
 
-# Operações persistentes usadas pelos módulos do painel.
 class EncomendaEntrada(BaseModel):
     recipient: str = Field(min_length=2)
     unit: str = Field(min_length=1)
@@ -782,3 +781,246 @@ def registrar_acesso_manual(dados: AcessoEntrada, usuario=Depends(usuario_atual)
     registrar_atividade(conexao, "access", f"{'Entrada' if dados.direction == 'entrada' else 'Saída'} registrada", f"{dados.person} · {dados.unit}")
     conexao.commit()
     return acesso_para_dict(conexao.execute("SELECT * FROM acessos WHERE id = ?", (acesso_id,)).fetchone())
+
+
+class EstoqueEntrada(BaseModel):
+    name: str = Field(min_length=2)
+    sku: str = Field(min_length=2)
+    category: str = Field(min_length=2)
+    unit: str = Field(min_length=1)
+    quantity: int = Field(ge=0)
+    minimum: int = Field(ge=0)
+    location: str = Field(min_length=2)
+
+
+class MovimentacaoEntrada(BaseModel):
+    movement: Literal["entrada", "saída"]
+    amount: int = Field(gt=0)
+    reason: str = Field(min_length=2)
+
+
+class ReservaEntrada(BaseModel):
+    space: str = Field(min_length=2)
+    title: str = Field(min_length=2)
+    resident: str = Field(min_length=2)
+    unit: str = Field(min_length=1)
+    startsAt: str
+    endsAt: str
+    guests: int = Field(gt=0, le=300)
+
+
+def estoque_para_dict(item):
+    return {
+        "id": item["id"], "name": item["nome"], "sku": item["sku"], "category": item["categoria"],
+        "unit": item["unidade"], "quantity": item["quantidade"], "minimum": item["minimo"],
+        "location": item["localizacao"], "updatedAt": item["atualizado_em"],
+    }
+
+
+@app.get("/estoque")
+def listar_estoque(_usuario=Depends(usuario_atual), conexao=Depends(get_db)):
+    itens = conexao.execute("SELECT * FROM estoque ORDER BY nome").fetchall()
+    return [estoque_para_dict(item) for item in itens]
+
+
+@app.post("/estoque", status_code=201)
+def criar_item_estoque(dados: EstoqueEntrada, usuario=Depends(usuario_atual), conexao=Depends(get_db)):
+    try:
+        cursor = conexao.execute(
+            """
+            INSERT INTO estoque(nome, sku, categoria, unidade, quantidade, minimo, localizacao, atualizado_em)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (dados.name, dados.sku, dados.category, dados.unit, dados.quantity, dados.minimum, dados.location, agora()),
+        )
+        if dados.quantity:
+            conexao.execute(
+                "INSERT INTO movimentacoes_estoque(estoque_id, movimento, quantidade, motivo, operador_id, criado_em) VALUES (?, 'entrada', ?, ?, ?, ?)",
+                (cursor.lastrowid, dados.quantity, "Saldo inicial", usuario["id"], agora()),
+            )
+        conexao.commit()
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=400, detail="SKU já cadastrado.")
+    return estoque_para_dict(conexao.execute("SELECT * FROM estoque WHERE id = ?", (cursor.lastrowid,)).fetchone())
+
+
+@app.post("/estoque/{id}/movimentacoes")
+def movimentar_estoque(id: int, dados: MovimentacaoEntrada, usuario=Depends(usuario_atual), conexao=Depends(get_db)):
+    item = conexao.execute("SELECT * FROM estoque WHERE id = ?", (id,)).fetchone()
+    if item is None:
+        raise HTTPException(status_code=404, detail="Item de estoque não encontrado.")
+    delta = dados.amount if dados.movement == "entrada" else -dados.amount
+    quantidade_final = item["quantidade"] + delta
+    if quantidade_final < 0:
+        raise HTTPException(status_code=400, detail="Movimentação deixaria o estoque negativo.")
+    momento = agora()
+    conexao.execute("UPDATE estoque SET quantidade = ?, atualizado_em = ? WHERE id = ?", (quantidade_final, momento, id))
+    conexao.execute(
+        "INSERT INTO movimentacoes_estoque(estoque_id, movimento, quantidade, motivo, operador_id, criado_em) VALUES (?, ?, ?, ?, ?, ?)",
+        (id, dados.movement, dados.amount, dados.reason, usuario["id"], momento),
+    )
+    registrar_atividade(conexao, "inventory", "Estoque movimentado", f"{item['nome']}: {dados.movement} {dados.amount}")
+    conexao.commit()
+    return estoque_para_dict(conexao.execute("SELECT * FROM estoque WHERE id = ?", (id,)).fetchone())
+
+
+def reserva_para_dict(item):
+    return {
+        "id": item["id"], "space": item["espaco"], "title": item["titulo"], "resident": item["responsavel"],
+        "unit": item["unidade"], "startsAt": item["inicio"], "endsAt": item["fim"], "guests": item["convidados"],
+        "status": item["status"],
+    }
+
+
+@app.get("/reservas")
+def listar_reservas(_usuario=Depends(usuario_atual), conexao=Depends(get_db)):
+    itens = conexao.execute("SELECT * FROM reservas ORDER BY inicio").fetchall()
+    return [reserva_para_dict(item) for item in itens]
+
+
+@app.post("/reservas", status_code=201)
+def criar_reserva(dados: ReservaEntrada, usuario=Depends(usuario_atual), conexao=Depends(get_db)):
+    if dados.endsAt <= dados.startsAt:
+        raise HTTPException(status_code=400, detail="O término deve ser posterior ao início.")
+    conflito = conexao.execute(
+        """
+        SELECT id FROM reservas
+        WHERE espaco = ? AND status = 'confirmada'
+          AND inicio < ? AND fim > ?
+        """,
+        (dados.space, dados.endsAt, dados.startsAt),
+    ).fetchone()
+    if conflito is not None:
+        raise HTTPException(status_code=400, detail="Já existe uma reserva nesse horário.")
+    cursor = conexao.execute(
+        """
+        INSERT INTO reservas(espaco, titulo, responsavel, unidade, inicio, fim, convidados, criado_em)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (dados.space, dados.title, dados.resident, dados.unit, dados.startsAt, dados.endsAt, dados.guests, agora()),
+    )
+    registrar_atividade(conexao, "event", "Reserva confirmada", f"{dados.space} · {dados.unit}")
+    conexao.commit()
+    return reserva_para_dict(conexao.execute("SELECT * FROM reservas WHERE id = ?", (cursor.lastrowid,)).fetchone())
+
+
+@app.patch("/reservas/{id}/cancelar")
+def cancelar_reserva(id: int, _usuario=Depends(usuario_atual), conexao=Depends(get_db)):
+    reserva = conexao.execute("SELECT * FROM reservas WHERE id = ?", (id,)).fetchone()
+    if reserva is None:
+        raise HTTPException(status_code=404, detail="Reserva não encontrada.")
+    if reserva["status"] != "confirmada":
+        raise HTTPException(status_code=400, detail="Reserva já está cancelada.")
+    conexao.execute("UPDATE reservas SET status = 'cancelada' WHERE id = ?", (id,))
+    conexao.commit()
+    return reserva_para_dict(conexao.execute("SELECT * FROM reservas WHERE id = ?", (id,)).fetchone())
+
+
+class ConfiguracoesEntrada(BaseModel):
+    condominiumName: str = Field(min_length=2)
+    document: str = Field(min_length=2)
+    address: str = Field(min_length=2)
+    packageNotifications: bool = True
+    visitorNotifications: bool = True
+    occurrenceNotifications: bool = True
+
+
+class PreferenciasEntrada(BaseModel):
+    email: bool = True
+    push: bool = True
+    digest: bool = False
+
+
+class SenhaEntrada(BaseModel):
+    currentPassword: str = Field(min_length=6)
+    newPassword: str = Field(min_length=6)
+
+
+def ler_configuracoes(conexao):
+    valores = {item["chave"]: item["valor"] for item in conexao.execute("SELECT chave, valor FROM configuracoes").fetchall()}
+    padrao = {
+        "condominiumName": "Residencial COGEM",
+        "document": "",
+        "address": "",
+        "packageNotifications": True,
+        "visitorNotifications": True,
+        "occurrenceNotifications": True,
+    }
+    for chave, valor in valores.items():
+        if chave in padrao and isinstance(padrao[chave], bool):
+            padrao[chave] = valor == "true"
+        elif chave in padrao:
+            padrao[chave] = valor
+    return padrao
+
+
+@app.get("/configuracoes")
+def buscar_configuracoes(_usuario=Depends(usuario_atual), conexao=Depends(get_db)):
+    return ler_configuracoes(conexao)
+
+
+@app.put("/configuracoes")
+def salvar_configuracoes(dados: ConfiguracoesEntrada, _usuario=Depends(exigir_administrador), conexao=Depends(get_db)):
+    valores = dados.model_dump()
+    for chave, valor in valores.items():
+        conexao.execute(
+            "INSERT INTO configuracoes(chave, valor) VALUES (?, ?) ON CONFLICT(chave) DO UPDATE SET valor = excluded.valor",
+            (chave, str(valor).lower() if isinstance(valor, bool) else str(valor)),
+        )
+    conexao.commit()
+    return ler_configuracoes(conexao)
+
+
+@app.get("/perfil/preferencias")
+def buscar_preferencias(usuario=Depends(usuario_atual), conexao=Depends(get_db)):
+    item = conexao.execute("SELECT * FROM preferencias_usuarios WHERE usuario_id = ?", (usuario["id"],)).fetchone()
+    if item is None:
+        return {"email": True, "push": True, "digest": False}
+    return {"email": bool(item["email"]), "push": bool(item["push"]), "digest": bool(item["digest"])}
+
+
+@app.put("/perfil/preferencias")
+def salvar_preferencias(dados: PreferenciasEntrada, usuario=Depends(usuario_atual), conexao=Depends(get_db)):
+    conexao.execute(
+        """
+        INSERT INTO preferencias_usuarios(usuario_id, email, push, digest)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(usuario_id) DO UPDATE SET email = excluded.email, push = excluded.push, digest = excluded.digest
+        """,
+        (usuario["id"], int(dados.email), int(dados.push), int(dados.digest)),
+    )
+    conexao.commit()
+    return dados.model_dump()
+
+
+@app.put("/auth/password")
+def alterar_senha(dados: SenhaEntrada, usuario=Depends(usuario_atual), conexao=Depends(get_db)):
+    if not verificar_senha(dados.currentPassword, usuario["senha_hash"]):
+        raise HTTPException(status_code=400, detail="Senha atual incorreta.")
+    conexao.execute("UPDATE usuarios SET senha_hash = ? WHERE id = ?", (senha_hash(dados.newPassword), usuario["id"]))
+    conexao.commit()
+    return {"mensagem": "Senha alterada com sucesso."}
+
+
+@app.get("/atividades")
+def listar_atividades(limit: int = 100, _usuario=Depends(usuario_atual), conexao=Depends(get_db)):
+    limit = max(1, min(limit, 100))
+    itens = conexao.execute("SELECT * FROM atividades ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    return [{"id": item["id"], "icon": item["icone"], "title": item["titulo"], "description": item["descricao"], "createdAt": item["criado_em"]} for item in itens]
+
+
+@app.get("/dashboard")
+def dashboard(_usuario=Depends(usuario_atual), conexao=Depends(get_db)):
+    def count(query, params=()):
+        return conexao.execute(query, params).fetchone()[0]
+
+    return {
+        "occurrencesActive": count("SELECT count(*) FROM ocorrencias WHERE status NOT IN ('concluída', 'resolvida')"),
+        "urgentOccurrences": count("SELECT count(*) FROM ocorrencias WHERE tipo = 'urgente' AND status NOT IN ('concluída', 'resolvida')"),
+        "pendingPackages": count("SELECT count(*) FROM encomendas WHERE status = 'aguardando retirada'"),
+        "visitorsInside": count("SELECT count(*) FROM visitantes WHERE status = 'dentro'"),
+        "lowStock": count("SELECT count(*) FROM estoque WHERE quantidade <= minimo"),
+        "keysCheckedOut": count("SELECT count(*) FROM chaves WHERE status = 'retirada'"),
+        "upcomingReservations": count("SELECT count(*) FROM reservas WHERE status = 'confirmada' AND inicio >= ?", (agora(),)),
+        "activities": listar_atividades(7, _usuario, conexao),
+    }

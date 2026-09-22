@@ -166,6 +166,15 @@ def criar_tabelas(conexao):
     criado_em TEXT NOT NULL
     )""")
 
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS preferencias_usuarios(
+    usuario_id INTEGER PRIMARY KEY,
+    email INTEGER NOT NULL DEFAULT 1,
+    push INTEGER NOT NULL DEFAULT 1,
+    digest INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (usuario_id) REFERENCES usuarios(id)
+    )""")
+
     colunas = {coluna[1] for coluna in cursor.execute("PRAGMA table_info(ocorrencias)")}
     novas_colunas = {
         "atualizado_em": "TEXT",
