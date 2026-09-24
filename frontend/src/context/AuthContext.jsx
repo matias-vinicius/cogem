@@ -2,11 +2,18 @@ import { createContext, useContext, useMemo, useState } from 'react'
 import { demoUsers } from '../data/seed'
 
 const AuthContext = createContext(null)
-const SESSION_KEY = 'cogem_session_v3'
+const SESSION_KEY = 'cogem_session_v1'
+const DATA_KEY = 'cogem_data_v1'
+const LEGACY_SESSION_KEYS = ['cogem_session_v5']
+const LEGACY_DATA_KEYS = ['cogem_data_v6']
 
 function readSession() {
   try {
-    return JSON.parse(localStorage.getItem(SESSION_KEY) || 'null')
+    const current = localStorage.getItem(SESSION_KEY)
+    if (current) return JSON.parse(current)
+    const legacy = LEGACY_SESSION_KEYS.map((key) => localStorage.getItem(key)).find(Boolean)
+    if (legacy) localStorage.setItem(SESSION_KEY, legacy)
+    return JSON.parse(legacy || 'null')
   } catch {
     return null
   }
@@ -18,7 +25,8 @@ export function AuthProvider({ children }) {
   function login(email, password) {
     const storedUsers = (() => {
       try {
-        return JSON.parse(localStorage.getItem('cogem_data_v3'))?.users || demoUsers
+        const stored = localStorage.getItem(DATA_KEY) || LEGACY_DATA_KEYS.map((key) => localStorage.getItem(key)).find(Boolean)
+        return JSON.parse(stored)?.users || demoUsers
       } catch {
         return demoUsers
       }
@@ -39,6 +47,7 @@ export function AuthProvider({ children }) {
 
   function logout() {
     localStorage.removeItem(SESSION_KEY)
+    LEGACY_SESSION_KEYS.forEach((key) => localStorage.removeItem(key))
     setUser(null)
   }
 
