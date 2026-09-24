@@ -16,6 +16,14 @@ import ProfilePage from './pages/ProfilePage'
 import SettingsPage from './pages/SettingsPage'
 import UsersPage from './pages/UsersPage'
 import VisitorsPage from './pages/VisitorsPage'
+import VehiclesPage from './pages/VehiclesPage'
+import CommunicationsPage from './pages/CommunicationsPage'
+import MaintenancePage from './pages/MaintenancePage'
+import DocumentsPage from './pages/DocumentsPage'
+import FinancePage from './pages/FinancePage'
+import AssembliesPage from './pages/AssembliesPage'
+import RegistrationsPage from './pages/RegistrationsPage'
+import { getRoleHome } from './config/permissions'
 
 const protectedRoutes = [
   { path: '/', module: 'dashboard', element: <DashboardPage /> },
@@ -24,9 +32,16 @@ const protectedRoutes = [
   { path: '/livro-portaria', module: 'logbook', element: <LogbookPage /> },
   { path: '/chaves', module: 'keys', element: <KeysPage /> },
   { path: '/visitantes', module: 'visitors', element: <VisitorsPage /> },
+  { path: '/veiculos', module: 'vehicles', element: <VehiclesPage /> },
   { path: '/controle-acesso', module: 'access', element: <AccessPage /> },
   { path: '/estoque', module: 'inventory', element: <InventoryPage /> },
   { path: '/reservas', module: 'events', element: <EventsPage /> },
+  { path: '/comunicacao', module: 'communications', element: <CommunicationsPage /> },
+  { path: '/manutencao', module: 'maintenanceHub', element: <MaintenancePage /> },
+  { path: '/documentos', module: 'documents', element: <DocumentsPage /> },
+  { path: '/financeiro', module: 'finance', element: <FinancePage /> },
+  { path: '/assembleias', module: 'assemblies', element: <AssembliesPage /> },
+  { path: '/cadastros', module: 'registrations', element: <RegistrationsPage /> },
   { path: '/usuarios', module: 'users', element: <UsersPage /> },
   { path: '/configuracoes', module: 'settings', element: <SettingsPage /> },
   { path: '/perfil', module: 'profile', element: <ProfilePage /> },
@@ -34,7 +49,9 @@ const protectedRoutes = [
 ]
 
 function PrivateArea() {
-  return <AppShell><Routes>{protectedRoutes.map((route) => <Route key={route.path} path={route.path} element={<ProtectedRoute module={route.module}>{route.element}</ProtectedRoute>} />)}<Route path="*" element={<Navigate to="/" replace />} /></Routes></AppShell>
+  const { user } = useAuth()
+  const home = getRoleHome(user.role)
+  return <AppShell><Routes>{protectedRoutes.map((route) => <Route key={route.path} path={route.path} element={route.path === '/' && user.role === 'resident' ? <Navigate to="/encomendas" replace /> : <ProtectedRoute module={route.module}>{route.element}</ProtectedRoute>} />)}<Route path="*" element={<Navigate to={home} replace />} /></Routes></AppShell>
 }
 
 export default function App() {

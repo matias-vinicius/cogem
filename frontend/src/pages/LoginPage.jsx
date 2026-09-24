@@ -5,11 +5,11 @@ import { ROLE_LABELS } from '../config/permissions'
 import { useAuth } from '../context/AuthContext'
 
 const demoRoles = [
-  { role: 'admin', label: 'Administrador', description: 'Acesso completo' },
-  { role: 'manager', label: 'Síndico', description: 'Gestão do condomínio' },
-  { role: 'concierge', label: 'Portaria', description: 'Operação e acessos' },
-  { role: 'maintenance', label: 'Manutenção', description: 'Ocorrências e estoque' },
-  { role: 'resident', label: 'Morador', description: 'Serviços da unidade' },
+  { role: 'admin', label: 'Administrador', description: 'Plataforma e operação' },
+  { role: 'manager', label: 'Síndico', description: 'Gestão completa e financeiro' },
+  { role: 'concierge', label: 'Portaria', description: 'Encomendas e acessos' },
+  { role: 'maintenance', label: 'Manutenção', description: 'OS, ocorrências e estoque' },
+  { role: 'resident', label: 'Morador', description: 'Encomendas e ocorrências' },
 ]
 
 export default function LoginPage() {
@@ -41,13 +41,13 @@ export default function LoginPage() {
   return (
     <main className="login-page">
       <section className="login-showcase">
-        <div className="login-brand"><span><Building2 size={30} /></span><div><strong>COGEM</strong><small>Gestão inteligente para condomínios</small></div></div>
+        <div className="login-brand"><span><Building2 size={30} /></span><div><strong>COGEM <em>V1</em></strong><small>Gestão inteligente para condomínios</small></div></div>
         <div className="login-message"><span className="eyebrow light">Operação centralizada</span><h1>Seu condomínio conectado, organizado e seguro.</h1><p>Ocorrências, portaria, encomendas, visitantes, estoque e acessos em um único sistema.</p><ul><li><CheckCircle2 />Informações em tempo real</li><li><CheckCircle2 />Perfis com níveis de acesso</li><li><CheckCircle2 />Interface responsiva e intuitiva</li></ul></div>
         <div className="login-shape shape-one" /><div className="login-shape shape-two" />
       </section>
       <section className="login-panel">
         <div className="login-form-wrap">
-          <div className="login-mobile-logo"><Building2 size={26} /><strong>COGEM</strong></div>
+          <div className="login-mobile-logo"><Building2 size={26} /><strong>COGEM V1</strong></div>
           <span className="login-icon"><ShieldCheck size={25} /></span><h2>Bem-vindo de volta</h2><p>Acesse sua conta para continuar.</p>
           <form onSubmit={submit}>
             <label><span>E-mail</span><div className="input-with-icon"><Mail size={17} /><input type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="seu@email.com" required /></div></label>
