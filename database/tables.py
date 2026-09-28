@@ -175,6 +175,97 @@ def criar_tabelas(conexao):
     FOREIGN KEY (usuario_id) REFERENCES usuarios(id)
     )""")
 
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS api_records(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    condominium_id TEXT NOT NULL,
+    entity TEXT NOT NULL,
+    unit_key TEXT,
+    owner_id INTEGER,
+    payload TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (owner_id) REFERENCES usuarios(id)
+    )""")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS audit_logs(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    condominium_id TEXT NOT NULL,
+    user_id INTEGER,
+    action TEXT NOT NULL,
+    module TEXT NOT NULL,
+    record_id TEXT,
+    occurred_at TEXT NOT NULL,
+    ip TEXT,
+    result TEXT NOT NULL,
+    details TEXT,
+    FOREIGN KEY (user_id) REFERENCES usuarios(id)
+    )""")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS api_tokens_revoked(
+    token_id TEXT PRIMARY KEY,
+    expires_at TEXT NOT NULL
+    )""")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS pickup_tokens(
+    token_hash TEXT PRIMARY KEY,
+    condominium_id TEXT NOT NULL,
+    package_id INTEGER NOT NULL,
+    expires_at TEXT NOT NULL,
+    used_at TEXT,
+    FOREIGN KEY (package_id) REFERENCES api_records(id)
+    )""")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS api_votes(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    condominium_id TEXT NOT NULL,
+    poll_id INTEGER NOT NULL,
+    voter_id INTEGER NOT NULL,
+    choice TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (condominium_id, poll_id, voter_id)
+    )""")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS notification_jobs(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    condominium_id TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    recipient TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+    )""")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS storage_files(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    condominium_id TEXT NOT NULL,
+    owner_id INTEGER NOT NULL,
+    module TEXT NOT NULL,
+    record_id TEXT,
+    original_name TEXT NOT NULL,
+    stored_name TEXT NOT NULL UNIQUE,
+    content_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (owner_id) REFERENCES usuarios(id)
+    )""")
+
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_api_records_scope ON api_records(condominium_id, entity, unit_key)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_logs_scope ON audit_logs(condominium_id, occurred_at)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_notification_jobs_status ON notification_jobs(status, created_at)")
+
+    user_columns = {column[1] for column in cursor.execute("PRAGMA table_info(usuarios)")}
+    if "condominium_id" not in user_columns:
+        cursor.execute("ALTER TABLE usuarios ADD COLUMN condominium_id TEXT NOT NULL DEFAULT 'cogem'")
+
     colunas = {coluna[1] for coluna in cursor.execute("PRAGMA table_info(ocorrencias)")}
     novas_colunas = {
         "atualizado_em": "TEXT",
