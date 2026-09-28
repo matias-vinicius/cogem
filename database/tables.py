@@ -223,11 +223,11 @@ def criar_tabelas(conexao):
     CREATE TABLE IF NOT EXISTS api_votes(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     condominium_id TEXT NOT NULL,
+    vote_type TEXT NOT NULL DEFAULT 'poll',
     poll_id INTEGER NOT NULL,
     voter_id INTEGER NOT NULL,
     choice TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    UNIQUE (condominium_id, poll_id, voter_id)
+    created_at TEXT NOT NULL
     )""")
 
     cursor.execute("""
@@ -261,6 +261,11 @@ def criar_tabelas(conexao):
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_api_records_scope ON api_records(condominium_id, entity, unit_key)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_logs_scope ON audit_logs(condominium_id, occurred_at)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_notification_jobs_status ON notification_jobs(status, created_at)")
+
+    vote_columns = {column[1] for column in cursor.execute("PRAGMA table_info(api_votes)")}
+    if "vote_type" not in vote_columns:
+        cursor.execute("ALTER TABLE api_votes ADD COLUMN vote_type TEXT NOT NULL DEFAULT 'poll'")
+    cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_api_votes_unique ON api_votes(condominium_id, vote_type, poll_id, voter_id)")
 
     user_columns = {column[1] for column in cursor.execute("PRAGMA table_info(usuarios)")}
     if "condominium_id" not in user_columns:
