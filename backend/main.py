@@ -5,18 +5,76 @@ import hmac
 import json
 import os
 import secrets
+import threading
+import time
+from collections import defaultdict, deque
 from datetime import datetime
 from typing import Literal, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from starlette.responses import JSONResponse
 
 from database.connection import DB_PATH, get_db
 from database.tables import criar_tabelas
 
 app = FastAPI()
-TOKEN_SECRET = os.getenv("COGEM_TOKEN_SECRET", "cogem-alpha-change-me")
+cors_origins = [origin.strip() for origin in os.getenv(
+    "COGEM_CORS_ORIGINS",
+    "http://localhost:5173,http://127.0.0.1:5173",
+).split(",") if origin.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-File-Name", "X-Cogem-Webhook-Secret"],
+)
+rate_limit_buckets = defaultdict(deque)
+rate_limit_lock = threading.Lock()
+
+
+@app.middleware("http")
+async def rate_limit_api(request: Request, call_next):
+    if request.url.path.startswith("/api/"):
+        client_ip = request.client.host if request.client else "unknown"
+        key = (client_ip, request.url.path.split("/", 3)[2])
+        limit = 10 if request.url.path == "/api/auth/login" else 300
+        current = time.monotonic()
+        with rate_limit_lock:
+            bucket = rate_limit_buckets[key]
+            while bucket and current - bucket[0] >= 60:
+                bucket.popleft()
+            if len(bucket) >= limit:
+                return JSONResponse(status_code=429, content={"message": "Limite de requisições excedido."})
+            bucket.append(current)
+    return await call_next(request)
+
+
+@app.exception_handler(HTTPException)
+async def api_http_error(_request: Request, exc: HTTPException):
+    message = exc.detail if isinstance(exc.detail, str) else "Requisição não autorizada."
+    return JSONResponse(status_code=exc.status_code, content={"message": message, "detail": exc.detail}, headers=exc.headers)
+
+
+@app.exception_handler(RequestValidationError)
+async def api_validation_error(_request: Request, exc: RequestValidationError):
+    return JSONResponse(status_code=422, content={"message": "Payload inválido.", "detail": exc.errors()})
+
+
+TOKEN_SECRET = os.getenv("COGEM_TOKEN_SECRET") or secrets.token_urlsafe(48)
+os.environ.setdefault("COGEM_TOKEN_SECRET", TOKEN_SECRET)
 PERFIS_ADMINISTRATIVOS = {"admin", "manager"}
+LEGACY_ROUTE_MODULES = {
+    "/usuarios": "users", "/encomendas": "packages", "/ocorrencia": "occurrences",
+    "/ocorrencias": "occurrences", "/Ocorrencia": "occurrences", "/Ocorrencias": "occurrences",
+    "/livro-portaria": "logbook", "/chaves": "keys", "/visitantes": "visitors",
+    "/acessos": "access-logs", "/estoque": "inventory", "/reservas": "events",
+    "/configuracoes": "settings", "/dashboard": "dashboard", "/atividades": "dashboard",
+    "/perfil": "profile", "/auth/password": "profile",
+}
 
 
 def ocorrencia_para_dict(ocorrencia):
@@ -39,9 +97,20 @@ def ocorrencia_para_dict(ocorrencia):
 @app.on_event("startup")
 def startup_event():
     conexao = sqlite3.connect(DB_PATH)
+    conexao.execute("PRAGMA foreign_keys = ON")
     try:
         criar_tabelas(conexao)
-        criar_usuarios_demo(conexao)
+        if os.getenv("COGEM_SEED_DEMO_USERS", "").lower() == "true":
+            criar_usuarios_demo(conexao)
+        bootstrap_email = os.getenv("COGEM_BOOTSTRAP_ADMIN_EMAIL", "").strip().lower()
+        bootstrap_password = os.getenv("COGEM_BOOTSTRAP_ADMIN_PASSWORD", "")
+        if bootstrap_email and len(bootstrap_password) >= 12:
+            conexao.execute(
+                """INSERT OR IGNORE INTO usuarios(nome,email,senha_hash,perfil,unidade,criado_em)
+                   VALUES(?,?,?,?,?,?)""",
+                (os.getenv("COGEM_BOOTSTRAP_ADMIN_NAME", "Gestor inicial"), bootstrap_email,
+                 senha_hash(bootstrap_password), "manager", "Administração", datetime.now().isoformat(timespec="seconds")),
+            )
         conexao.commit()
     finally:
         conexao.close()
@@ -89,16 +158,22 @@ class UsuarioStatus(BaseModel):
 
 def senha_hash(senha):
     salt = secrets.token_bytes(16)
-    digest = hashlib.pbkdf2_hmac("sha256", senha.encode(), salt, 120000)
-    return f"{base64.urlsafe_b64encode(salt).decode()}${base64.urlsafe_b64encode(digest).decode()}"
+    digest = hashlib.pbkdf2_hmac("sha256", senha.encode(), salt, 240000)
+    return f"v2$240000${base64.urlsafe_b64encode(salt).decode()}${base64.urlsafe_b64encode(digest).decode()}"
 
 
 def verificar_senha(senha, armazenada):
     try:
-        salt_texto, digest_texto = armazenada.split("$", 1)
+        partes = armazenada.split("$")
+        if len(partes) == 4 and partes[0] == "v2":
+            iteracoes = int(partes[1])
+            salt_texto, digest_texto = partes[2:]
+        else:
+            salt_texto, digest_texto = armazenada.split("$", 1)
+            iteracoes = 120000
         salt = base64.urlsafe_b64decode(salt_texto.encode())
         esperado = base64.urlsafe_b64decode(digest_texto.encode())
-        atual = hashlib.pbkdf2_hmac("sha256", senha.encode(), salt, 120000)
+        atual = hashlib.pbkdf2_hmac("sha256", senha.encode(), salt, iteracoes)
         return hmac.compare_digest(atual, esperado)
     except (ValueError, TypeError):
         return False
@@ -135,12 +210,17 @@ def criar_usuarios_demo(conexao):
 
 
 def criar_token(usuario_id):
-    payload = base64.urlsafe_b64encode(json.dumps({"id": usuario_id}).encode()).decode()
+    claims = {
+        "id": usuario_id,
+        "jti": secrets.token_urlsafe(18),
+        "exp": int(datetime.now().timestamp()) + 43200,
+    }
+    payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
     assinatura = hmac.new(TOKEN_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
     return f"{payload}.{assinatura}"
 
 
-def usuario_atual(authorization: Optional[str] = Header(default=None), conexao=Depends(get_db)):
+def usuario_atual(request: Request, authorization: Optional[str] = Header(default=None), conexao=Depends(get_db)):
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Autenticação necessária.")
     token = authorization.split(" ", 1)[1]
@@ -149,13 +229,32 @@ def usuario_atual(authorization: Optional[str] = Header(default=None), conexao=D
         esperada = hmac.new(TOKEN_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(assinatura, esperada):
             raise ValueError
-        usuario_id = json.loads(base64.urlsafe_b64decode(payload.encode()))["id"]
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        usuario_id = claims["id"]
+        token_id = claims["jti"]
+        if int(claims["exp"]) <= int(datetime.now().timestamp()):
+            raise ValueError
     except (ValueError, KeyError, TypeError, json.JSONDecodeError):
         raise HTTPException(status_code=401, detail="Token inválido.")
+
+    token_revogado = conexao.execute("SELECT 1 FROM api_tokens_revoked WHERE token_id = ?", (token_id,)).fetchone()
+    if token_revogado:
+        raise HTTPException(status_code=401, detail="Sessão encerrada.")
 
     usuario = conexao.execute("SELECT * FROM usuarios WHERE id = ?", (usuario_id,)).fetchone()
     if usuario is None or not usuario["ativo"]:
         raise HTTPException(status_code=401, detail="Usuário inválido ou desativado.")
+    for prefix, module in LEGACY_ROUTE_MODULES.items():
+        if request.url.path == prefix or request.url.path.startswith(prefix + "/"):
+            if module == "dashboard":
+                api_require_module(usuario, module)
+            elif module == "profile":
+                continue
+            else:
+                api_require_module(usuario, module)
+            if usuario["condominium_id"] != "cogem":
+                raise HTTPException(status_code=403, detail="Use as rotas /api com isolamento por condomínio.")
+            break
     return usuario
 
 
@@ -175,7 +274,22 @@ def login(dados: LoginEntrada, conexao=Depends(get_db)):
         raise HTTPException(status_code=401, detail="E-mail ou senha incorretos.")
     if not usuario["ativo"]:
         raise HTTPException(status_code=403, detail="Este usuário está desativado.")
-    return {"token": criar_token(usuario["id"]), "user": usuario_para_dict(usuario)}
+    if not usuario["senha_hash"].startswith("v2$"):
+        conexao.execute("UPDATE usuarios SET senha_hash = ? WHERE id = ?", (senha_hash(dados.password), usuario["id"]))
+        conexao.commit()
+    token = criar_token(usuario["id"])
+    return {"token": token, "accessToken": token, "user": usuario_para_dict(usuario)}
+
+
+@app.post("/auth/logout", status_code=204)
+def logout(authorization: Optional[str] = Header(default=None), usuario=Depends(usuario_atual), conexao=Depends(get_db)):
+    token = authorization.split(" ", 1)[1]
+    payload = token.split(".", 1)[0]
+    claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    expiracao = datetime.fromtimestamp(claims["exp"]).isoformat(timespec="seconds")
+    conexao.execute("INSERT OR IGNORE INTO api_tokens_revoked(token_id,expires_at) VALUES(?,?)", (claims["jti"], expiracao))
+    conexao.commit()
+    return None
 
 
 @app.get("/auth/me", response_model=UsuarioResposta)
@@ -191,6 +305,10 @@ def listar_usuarios(_usuario=Depends(exigir_administrador), conexao=Depends(get_
 
 @app.post("/usuarios", response_model=UsuarioResposta, status_code=201)
 def criar_usuario(dados: UsuarioEntrada, _usuario=Depends(exigir_administrador), conexao=Depends(get_db)):
+    if len(dados.password) < 8:
+        raise HTTPException(status_code=422, detail="A senha deve ter ao menos 8 caracteres.")
+    if _usuario["perfil"] == "admin" and dados.role in {"admin", "manager"}:
+        raise HTTPException(status_code=403, detail="Não é permitido administrar contas de administrador da plataforma.")
     try:
         cursor = conexao.execute(
             """
@@ -218,6 +336,8 @@ def alterar_status_usuario(id: int, dados: UsuarioStatus, _usuario=Depends(exigi
     usuario = conexao.execute("SELECT * FROM usuarios WHERE id = ?", (id,)).fetchone()
     if usuario is None:
         raise HTTPException(status_code=404, detail="Usuário não encontrado.")
+    if _usuario["perfil"] == "admin" and usuario["perfil"] in {"admin", "manager"}:
+        raise HTTPException(status_code=403, detail="Não é permitido administrar contas de administrador da plataforma.")
     conexao.execute("UPDATE usuarios SET ativo = ? WHERE id = ?", (int(dados.active), id))
     conexao.commit()
     usuario = conexao.execute("SELECT * FROM usuarios WHERE id = ?", (id,)).fetchone()
@@ -280,7 +400,7 @@ def registrar_historico(conexao, ocorrencia_id, status_anterior, status_novo, al
 
 @app.post("/ocorrencia")
 @app.post("/Ocorrencia")
-def registrar_ocorrencia(ocorrencia: Ocorrencia, conexao=Depends(get_db)):
+def registrar_ocorrencia(ocorrencia: Ocorrencia, usuario=Depends(usuario_atual), conexao=Depends(get_db)):
     agora = datetime.now().isoformat(timespec="seconds")
     cursor = conexao.cursor()
     tipos_validos = ["comum", "urgente"]
@@ -293,9 +413,9 @@ def registrar_ocorrencia(ocorrencia: Ocorrencia, conexao=Depends(get_db)):
         """
         INSERT INTO ocorrencias(
             bloco, andar, lado, descricao, criado_em, atualizado_em,
-            titulo, tipo
+            titulo, tipo, condominium_id, unit_key, owner_id
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             ocorrencia.block,
@@ -306,6 +426,9 @@ def registrar_ocorrencia(ocorrencia: Ocorrencia, conexao=Depends(get_db)):
             agora,
             ocorrencia.title,
             tipo,
+            usuario["condominium_id"],
+            usuario["unidade"] if usuario["perfil"] == "resident" else None,
+            usuario["id"],
         ),
     )
     registrar_historico(conexao, cursor.lastrowid, None, "em aberto", agora)
@@ -320,12 +443,17 @@ def registrar_ocorrencia(ocorrencia: Ocorrencia, conexao=Depends(get_db)):
 def buscar_ocorrencias(
     status: Optional[str] = None,
     type: Optional[str] = None,
+    usuario=Depends(usuario_atual),
     conexao=Depends(get_db),
 ):
     cursor = conexao.cursor()
-    consulta = "SELECT * FROM ocorrencias"
+    consulta = "SELECT * FROM ocorrencias WHERE condominium_id = ?"
     filtros = []
-    valores = []
+    valores = [usuario["condominium_id"]]
+
+    if usuario["perfil"] == "resident":
+        filtros.append("(owner_id = ? OR unit_key = ?)")
+        valores.extend([usuario["id"], usuario["unidade"]])
 
     if status is not None:
         filtros.append("status = ?")
@@ -336,7 +464,7 @@ def buscar_ocorrencias(
         valores.append(type.lower())
 
     if filtros:
-        consulta += " WHERE " + " AND ".join(filtros)
+        consulta += " AND " + " AND ".join(filtros)
 
     cursor.execute(consulta, valores)
     ocorrencias = cursor.fetchall()
@@ -346,9 +474,14 @@ def buscar_ocorrencias(
 
 @app.get("/ocorrencia/{id}", response_model=OcorrenciaResposta)
 @app.get("/Ocorrencia/{id}", response_model=OcorrenciaResposta)
-def buscar_ocorrencia(id: int, conexao=Depends(get_db)):
+def buscar_ocorrencia(id: int, usuario=Depends(usuario_atual), conexao=Depends(get_db)):
     cursor = conexao.cursor()
-    cursor.execute("SELECT * FROM ocorrencias WHERE id = ?", (id,))
+    consulta = "SELECT * FROM ocorrencias WHERE id = ? AND condominium_id = ?"
+    valores = [id, usuario["condominium_id"]]
+    if usuario["perfil"] == "resident":
+        consulta += " AND (owner_id = ? OR unit_key = ?)"
+        valores.extend([usuario["id"], usuario["unidade"]])
+    cursor.execute(consulta, valores)
     ocorrencia = cursor.fetchone()
 
     if ocorrencia is None:
@@ -362,10 +495,13 @@ def buscar_ocorrencia(id: int, conexao=Depends(get_db)):
 def atualizar_status(
     id: int,
     atualizacao: AtualizacaoStatus,
+    usuario=Depends(usuario_atual),
     conexao=Depends(get_db),
 ):
+    if usuario["perfil"] == "resident":
+        raise HTTPException(status_code=403, detail="Moradores não podem alterar o status da ocorrência.")
     cursor = conexao.cursor()
-    cursor.execute("SELECT * FROM ocorrencias WHERE id = ?", (id,))
+    cursor.execute("SELECT * FROM ocorrencias WHERE id = ? AND condominium_id = ?", (id, usuario["condominium_id"]))
     ocorrencia = cursor.fetchone()
 
     if ocorrencia is None:
@@ -405,9 +541,14 @@ def atualizar_status(
 
 @app.get("/ocorrencia/{id}/historico", response_model=list[HistoricoResposta])
 @app.get("/Ocorrencia/{id}/historico", response_model=list[HistoricoResposta])
-def buscar_historico(id: int, conexao=Depends(get_db)):
+def buscar_historico(id: int, usuario=Depends(usuario_atual), conexao=Depends(get_db)):
     cursor = conexao.cursor()
-    cursor.execute("SELECT id FROM ocorrencias WHERE id = ?", (id,))
+    consulta = "SELECT id FROM ocorrencias WHERE id = ? AND condominium_id = ?"
+    valores = [id, usuario["condominium_id"]]
+    if usuario["perfil"] == "resident":
+        consulta += " AND (owner_id = ? OR unit_key = ?)"
+        valores.extend([usuario["id"], usuario["unidade"]])
+    cursor.execute(consulta, valores)
     if cursor.fetchone() is None:
         raise HTTPException(status_code=404, detail="Ocorrência não encontrada!")
 
@@ -436,9 +577,11 @@ def buscar_historico(id: int, conexao=Depends(get_db)):
 
 @app.put("/ocorrencia/{id}/iniciar")
 @app.put("/Ocorrencia/{id}/iniciar")
-def iniciar_tarefa(id: int, conexao=Depends(get_db)):
+def iniciar_tarefa(id: int, usuario=Depends(usuario_atual), conexao=Depends(get_db)):
+    if usuario["perfil"] == "resident":
+        raise HTTPException(status_code=403, detail="Moradores não podem alterar o status da ocorrência.")
     cursor = conexao.cursor()
-    cursor.execute("SELECT * FROM ocorrencias WHERE id = ?", (id,))
+    cursor.execute("SELECT * FROM ocorrencias WHERE id = ? AND condominium_id = ?", (id, usuario["condominium_id"]))
     ocorrencia = cursor.fetchone()
 
     if ocorrencia is None:
@@ -463,9 +606,11 @@ def iniciar_tarefa(id: int, conexao=Depends(get_db)):
 
 @app.put("/ocorrencia/{id}/finalizar")
 @app.put("/Ocorrencia/{id}/finalizar")
-def finalizar_tarefa(id: int, conexao=Depends(get_db)):
+def finalizar_tarefa(id: int, usuario=Depends(usuario_atual), conexao=Depends(get_db)):
+    if usuario["perfil"] == "resident":
+        raise HTTPException(status_code=403, detail="Moradores não podem alterar o status da ocorrência.")
     cursor = conexao.cursor()
-    cursor.execute("SELECT * FROM ocorrencias WHERE id = ?", (id,))
+    cursor.execute("SELECT * FROM ocorrencias WHERE id = ? AND condominium_id = ?", (id, usuario["condominium_id"]))
     ocorrencia = cursor.fetchone()
 
     if ocorrencia is None:
@@ -545,16 +690,27 @@ def encomenda_para_dict(item):
 
 
 @app.get("/encomendas")
-def listar_encomendas(status: Optional[str] = None, _usuario=Depends(usuario_atual), conexao=Depends(get_db)):
+def listar_encomendas(status: Optional[str] = None, usuario=Depends(usuario_atual), conexao=Depends(get_db)):
+    filtros = []
+    valores = []
     if status:
-        itens = conexao.execute("SELECT * FROM encomendas WHERE status = ? ORDER BY id DESC", (status,)).fetchall()
-    else:
-        itens = conexao.execute("SELECT * FROM encomendas ORDER BY id DESC").fetchall()
+        filtros.append("status = ?")
+        valores.append(status)
+    if usuario["perfil"] == "resident":
+        filtros.append("unidade = ?")
+        valores.append(usuario["unidade"])
+    consulta = "SELECT * FROM encomendas"
+    if filtros:
+        consulta += " WHERE " + " AND ".join(filtros)
+    consulta += " ORDER BY id DESC"
+    itens = conexao.execute(consulta, valores).fetchall()
     return [encomenda_para_dict(item) for item in itens]
 
 
 @app.post("/encomendas", status_code=201)
 def receber_encomenda(dados: EncomendaEntrada, usuario=Depends(usuario_atual), conexao=Depends(get_db)):
+    if usuario["perfil"] == "resident":
+        raise HTTPException(status_code=403, detail="Moradores não podem registrar encomendas.")
     cursor = conexao.execute(
         """
         INSERT INTO encomendas(destinatario, unidade, transportadora, rastreio, descricao, recebido_por, recebido_em)
@@ -569,6 +725,8 @@ def receber_encomenda(dados: EncomendaEntrada, usuario=Depends(usuario_atual), c
 
 @app.patch("/encomendas/{id}/entrega")
 def entregar_encomenda(id: int, dados: EntregaEntrada, usuario=Depends(usuario_atual), conexao=Depends(get_db)):
+    if usuario["perfil"] == "resident":
+        raise HTTPException(status_code=403, detail="Moradores não podem registrar retiradas.")
     item = conexao.execute("SELECT * FROM encomendas WHERE id = ?", (id,)).fetchone()
     if item is None:
         raise HTTPException(status_code=404, detail="Encomenda não encontrada.")
@@ -777,6 +935,29 @@ def listar_acessos(direction: Optional[str] = None, _usuario=Depends(usuario_atu
 
 @app.post("/acessos", status_code=201)
 def registrar_acesso_manual(dados: AcessoEntrada, usuario=Depends(usuario_atual), conexao=Depends(get_db)):
+    if dados.kind.strip().casefold() in {"vehicle", "veiculo", "veículo", "carro", "car"}:
+        plate = dados.person.replace("-", "").replace(" ", "").upper()
+        conexao.execute("BEGIN IMMEDIATE")
+        veiculos = conexao.execute(
+            "SELECT * FROM api_records WHERE condominium_id = ? AND entity = 'vehicles'",
+            (usuario["condominium_id"],),
+        ).fetchall()
+        veiculo = next(
+            (item for item in veiculos if json.loads(item["payload"]).get("plate", "").replace("-", "").replace(" ", "").upper() == plate),
+            None,
+        )
+        if veiculo is None:
+            conexao.rollback()
+            raise HTTPException(status_code=404, detail="Veículo não cadastrado.")
+        payload = json.loads(veiculo["payload"])
+        entrando = dados.direction == "entrada"
+        dentro = payload.get("inside", payload.get("status") == "dentro")
+        if entrando == dentro:
+            conexao.rollback()
+            raise HTTPException(status_code=409, detail="Veículo já está dentro." if entrando else "Veículo não está dentro.")
+        payload.update({"inside": entrando, "status": "dentro" if entrando else "fora", "lastMovementAt": agora()})
+        api_save_record(conexao, usuario, "vehicles", payload, veiculo["id"])
+        api_save_record(conexao, usuario, "vehicle-movements", {"vehicleId": veiculo["id"], "direction": dados.direction, "createdAt": agora(), "registeredBy": usuario["id"]})
     acesso_id = registrar_acesso(conexao, dados.person, dados.unit, dados.kind, dados.direction, dados.authorizedBy, usuario["id"])
     registrar_atividade(conexao, "access", f"{'Entrada' if dados.direction == 'entrada' else 'Saída'} registrada", f"{dados.person} · {dados.unit}")
     conexao.commit()
@@ -1024,3 +1205,10 @@ def dashboard(_usuario=Depends(usuario_atual), conexao=Depends(get_db)):
         "upcomingReservations": count("SELECT count(*) FROM reservas WHERE status = 'confirmada' AND inicio >= ?", (agora(),)),
         "activities": listar_atividades(7, _usuario, conexao),
     }
+
+
+from backend.api_v1 import require_module as api_require_module
+from backend.api_v1 import save_record as api_save_record
+from backend.api_v1 import router as api_v1_router
+
+app.include_router(api_v1_router)

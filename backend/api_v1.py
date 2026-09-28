@@ -2,30 +2,32 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 import os
+import re
 import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from database.connection import get_db, raiz
 
 router = APIRouter(prefix="/api")
-TOKEN_SECRET = os.getenv("COGEM_TOKEN_SECRET", "cogem-alpha-change-me")
+TOKEN_SECRET = os.getenv("COGEM_TOKEN_SECRET") or secrets.token_urlsafe(48)
 STORAGE_DIR = raiz / "uploads" / "private"
 TOKEN_TTL_SECONDS = 60 * 60 * 12
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+MAX_JSON_BYTES = 1024 * 1024
 
 ROLE_MODULES = {
-    "admin": {"occurrences", "packages", "logbook", "keys", "visitors", "access-logs", "access", "vehicles", "inventory", "events", "announcements", "work-orders", "maintenance-schedules", "documents", "users", "settings", "help", "profile"},
+    "admin": {"occurrences", "packages", "logbook", "keys", "visitors", "access-logs", "access", "vehicles", "inventory", "events", "announcements", "work-orders", "maintenance-schedules", "documents", "users", "settings", "help", "profile", "audit", "dashboard"},
     "manager": {"*"},
-    "concierge": {"occurrences", "packages", "logbook", "keys", "visitors", "vehicles", "access-logs", "access", "events", "announcements", "help", "profile"},
-    "maintenance": {"occurrences", "logbook", "inventory", "work-orders", "maintenance-schedules", "documents", "help", "profile"},
-    "resident": {"packages", "occurrences", "help", "profile", "announcements", "polls", "events", "pets", "moves"},
+    "concierge": {"occurrences", "packages", "logbook", "keys", "visitors", "vehicles", "access-logs", "access", "events", "announcements", "help", "profile", "dashboard"},
+    "maintenance": {"occurrences", "logbook", "inventory", "work-orders", "maintenance-schedules", "documents", "help", "profile", "dashboard"},
+    "resident": {"packages", "occurrences", "help", "profile", "announcements", "polls", "assemblies"},
 }
 
 ENTITY_MODULES = {
@@ -37,10 +39,11 @@ ENTITY_MODULES = {
     "financial": "financial", "assemblies": "assemblies", "pets": "pets", "moves": "moves",
     "meter-readings": "meter-readings", "users": "users", "settings": "settings",
     "help": "help", "profile": "profile", "audit": "audit",
+    "audit-logs": "audit", "dashboard": "dashboard",
 }
 
 REQUIRED_FIELDS = {
-    "occurrences": ("title", "description"), "packages": ("recipient", "unit", "carrier"),
+    "occurrences": ("title", "description", "block", "floor", "side"), "packages": ("recipient", "unit", "carrier"),
     "logbook": ("category", "title", "description"), "keys": ("name", "code", "location"),
     "visitors": ("name", "document", "unit", "resident", "validFrom", "validUntil"),
     "access-logs": ("person", "unit", "kind", "direction"), "vehicles": ("plate",),
@@ -62,6 +65,18 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def parse_iso(value):
+    if not isinstance(value, str):
+        fail(422, "Data deve estar no formato ISO 8601.")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        fail(422, "Data deve estar no formato ISO 8601.")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def json_payload(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
@@ -73,15 +88,21 @@ def fail(status: int, message: str):
 def password_hash(password: str):
     salt = secrets.token_bytes(16)
     digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 240000)
-    return f"{base64.urlsafe_b64encode(salt).decode()}${base64.urlsafe_b64encode(digest).decode()}"
+    return f"v2$240000${base64.urlsafe_b64encode(salt).decode()}${base64.urlsafe_b64encode(digest).decode()}"
 
 
 def verify_password(password: str, stored: str):
     try:
-        salt_text, digest_text = stored.split("$", 1)
+        parts = stored.split("$")
+        if len(parts) == 4 and parts[0] == "v2":
+            iterations = int(parts[1])
+            salt_text, digest_text = parts[2:]
+        else:
+            salt_text, digest_text = stored.split("$", 1)
+            iterations = 120000
         salt = base64.urlsafe_b64decode(salt_text.encode())
         digest = base64.urlsafe_b64decode(digest_text.encode())
-        candidate = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 240000)
+        candidate = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations)
         return hmac.compare_digest(candidate, digest)
     except (ValueError, TypeError):
         return False
@@ -128,7 +149,14 @@ def current_user(request: Request, connection=Depends(get_db)):
 
 
 def require_module(user, module: str):
-    allowed = ROLE_MODULES.get(user["perfil"], set())
+    baseline = ROLE_MODULES.get(user["perfil"], set())
+    allowed = baseline
+    if user["permissions_json"]:
+        try:
+            custom = set(json.loads(user["permissions_json"]))
+        except (TypeError, json.JSONDecodeError):
+            fail(403, "Permissões do usuário inválidas.")
+        allowed = custom if "*" in baseline else baseline.intersection(custom)
     if "*" not in allowed and module not in allowed:
         fail(403, "Permissão insuficiente.")
 
@@ -149,12 +177,22 @@ async def body_object(request: Request, required=True):
             fail(415, "Envie um corpo JSON.")
         return {}
     try:
-        value = await request.json()
+        raw = await read_limited_body(request, MAX_JSON_BYTES, "Corpo JSON maior que 1 MB.")
+        value = json.loads(raw, parse_constant=lambda _value: fail(400, "JSON inválido."))
     except (ValueError, json.JSONDecodeError):
         fail(400, "JSON inválido.")
     if not isinstance(value, dict):
         fail(422, "O corpo deve ser um objeto JSON.")
     return value
+
+
+async def read_limited_body(request: Request, maximum: int, error: str):
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > maximum:
+            fail(413, error)
+    return bytes(body)
 
 
 def validate_payload(entity: str, payload: dict):
@@ -163,13 +201,21 @@ def validate_payload(entity: str, payload: dict):
         fail(422, f"Campos obrigatórios: {', '.join(missing)}.")
     if entity == "inventory" and (not isinstance(payload.get("quantity"), (int, float)) or payload["quantity"] < 0):
         fail(422, "A quantidade deve ser um número não negativo.")
-    if entity == "events" and (not isinstance(payload.get("startsAt"), str) or not isinstance(payload.get("endsAt"), str) or payload["endsAt"] <= payload["startsAt"]):
+    if entity == "inventory" and (isinstance(payload["quantity"], bool) or not math.isfinite(float(payload["quantity"]))):
+        fail(422, "A quantidade precisa ser finita.")
+    if entity == "occurrences" and (not isinstance(payload.get("floor"), int) or not 0 <= payload["floor"] <= 99):
+        fail(422, "floor deve ser um inteiro entre 0 e 99.")
+    if entity == "occurrences" and payload.get("type", "comum") not in {"comum", "urgente"}:
+        fail(422, "Tipo de ocorrência inválido.")
+    if entity == "events" and parse_iso(payload["endsAt"]) <= parse_iso(payload["startsAt"]):
         fail(422, "O término precisa ser posterior ao início.")
-    if entity == "visitors" and payload["validUntil"] <= payload["validFrom"]:
+    if entity == "visitors" and parse_iso(payload["validUntil"]) <= parse_iso(payload["validFrom"]):
         fail(422, "A validade final precisa ser posterior à inicial.")
     if entity == "polls" and (not isinstance(payload["options"], list) or len(payload["options"]) < 2):
         fail(422, "A enquete precisa ter ao menos duas opções.")
-    if entity == "charges" and (not isinstance(payload["amount"], (int, float)) or payload["amount"] <= 0):
+    if entity == "assemblies" and "agenda" in payload and (not isinstance(payload["agenda"], list) or any(not isinstance(item, dict) for item in payload["agenda"])):
+        fail(422, "agenda deve ser uma lista de itens.")
+    if entity == "charges" and (not isinstance(payload["amount"], (int, float)) or not math.isfinite(float(payload["amount"])) or payload["amount"] <= 0):
         fail(422, "O valor da cobrança precisa ser positivo.")
 
 
@@ -177,7 +223,12 @@ def record_row(connection, user, entity, record_id, include_resident=True):
     row = connection.execute("SELECT * FROM api_records WHERE id = ? AND condominium_id = ? AND entity = ?", (record_id, user["condominium_id"], entity)).fetchone()
     if row is None:
         fail(404, "Registro não encontrado.")
-    if include_resident and user["perfil"] == "resident" and row["owner_id"] != user["id"] and row["unit_key"] != user["unidade"]:
+    if user["perfil"] == "maintenance" and entity == "documents":
+        payload = json.loads(row["payload"])
+        if payload.get("visibility") not in {"technical", "maintenance"} and payload.get("category") not in {"technical", "maintenance"}:
+            fail(404, "Registro não encontrado.")
+    shared_entities = {"announcements", "polls", "assemblies"}
+    if include_resident and user["perfil"] == "resident" and entity not in shared_entities and row["owner_id"] != user["id"] and row["unit_key"] != user["unidade"]:
         fail(404, "Registro não encontrado.")
     return row
 
@@ -194,6 +245,9 @@ def save_record(connection, user, entity, payload, record_id=None):
     if user["perfil"] == "resident":
         unit_key = user["unidade"]
         payload["unit"] = user["unidade"]
+        payload["residentId"] = user["id"]
+        for identity_field in ("unitId", "unit_id", "resident_id", "residentID", "condominiumId", "condominium_id"):
+            payload.pop(identity_field, None)
     if record_id is None:
         cursor = connection.execute(
             """INSERT INTO api_records(condominium_id,entity,unit_key,owner_id,payload,created_at,updated_at)
@@ -209,7 +263,7 @@ def save_record(connection, user, entity, payload, record_id=None):
 def list_records(connection, user, entity, filters=None):
     query = "SELECT * FROM api_records WHERE condominium_id=? AND entity=?"
     params = [user["condominium_id"], entity]
-    if user["perfil"] == "resident":
+    if user["perfil"] == "resident" and entity not in {"announcements", "polls", "assemblies"}:
         query += " AND (owner_id=? OR unit_key=?)"
         params.extend([user["id"], user["unidade"]])
     result = [record_dict(row) for row in connection.execute(query + " ORDER BY id DESC", params).fetchall()]
@@ -222,16 +276,34 @@ def list_records(connection, user, entity, filters=None):
             result = [item for item in result if str(value).casefold() in json_payload(item).casefold()]
         else:
             result = [item for item in result if str(item.get(key, "")) == str(value)]
-    page = max(1, int(filters.get("page", 1)))
-    limit = max(1, min(500, int(filters.get("limit", 100))))
+    if user["perfil"] == "maintenance" and entity == "documents":
+        result = [item for item in result if item.get("visibility") in {"technical", "maintenance"} or item.get("category") in {"technical", "maintenance"}]
+    try:
+        page = max(1, int(filters.get("page", 1)))
+        limit = max(1, min(500, int(filters.get("limit", 100))))
+    except (TypeError, ValueError):
+        fail(422, "page e limit devem ser inteiros.")
     return result[(page - 1) * limit:page * limit]
 
 
 def queue_notification(connection, condominium_id, channel, recipient, payload):
     moment = now_iso()
-    connection.execute("""INSERT INTO notification_jobs(condominium_id,channel,recipient,payload,status,created_at,updated_at)
-                          VALUES(?,?,?,?, 'queued', ?, ?)""",
-                       (condominium_id, channel, str(recipient), json_payload(payload), moment, moment))
+    cursor = connection.execute("""INSERT INTO notification_jobs(condominium_id,channel,recipient,payload,status,created_at,updated_at)
+                                  VALUES(?,?,?,?, 'queued', ?, ?)""",
+                                (condominium_id, channel, str(recipient), json_payload(payload), moment, moment))
+    return cursor.lastrowid
+
+
+def storage_cipher():
+    key_material = os.getenv("COGEM_STORAGE_ENCRYPTION_KEY")
+    if not key_material:
+        fail(503, "Configure COGEM_STORAGE_ENCRYPTION_KEY para habilitar storage privado.")
+    try:
+        from cryptography.fernet import Fernet
+    except ImportError:
+        fail(503, "Instale as dependências do backend para habilitar storage criptografado.")
+    key = base64.urlsafe_b64encode(hashlib.sha256(key_material.encode()).digest())
+    return Fernet(key)
 
 
 def issue_pickup_token(connection, condominium_id, package_id):
@@ -243,13 +315,26 @@ def issue_pickup_token(connection, condominium_id, package_id):
     return token, expires
 
 
+def require_private_image(connection, user, file_id, allowed_modules):
+    if not isinstance(file_id, int):
+        fail(422, "Informe imageFileId de uma imagem privada previamente enviada.")
+    row = connection.execute("SELECT * FROM storage_files WHERE id=? AND condominium_id=?", (file_id, user["condominium_id"])).fetchone()
+    if row is None or row["module"] not in allowed_modules or not row["content_type"].startswith("image/"):
+        fail(404, "Imagem privada não encontrada.")
+    return row
+
+
 @router.post("/auth/login")
 async def login(data: LoginBody, request: Request, connection=Depends(get_db)):
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", data.email.strip()):
+        fail(422, "E-mail inválido.")
     row = connection.execute("SELECT * FROM usuarios WHERE lower(email)=lower(?)", (data.email.strip(),)).fetchone()
     if row is None or not verify_password(data.password, row["senha_hash"]):
         fail(401, "E-mail ou senha incorretos.")
     if not row["ativo"]:
         fail(403, "Este usuário está desativado.")
+    if not row["senha_hash"].startswith("v2$"):
+        connection.execute("UPDATE usuarios SET senha_hash=? WHERE id=?", (password_hash(data.password), row["id"]))
     token = issue_token(row["id"])
     audit(connection, request, row, "login", "auth", row["id"])
     connection.commit()
@@ -277,8 +362,107 @@ async def dispatch(path: str, request: Request, connection=Depends(get_db)):
     method = request.method
     if not parts:
         fail(404, "Endpoint não encontrado.")
-    if parts[:2] == ["access", "facial"]:
-        fail(503, "Provedor de biometria não configurado.")
+    if parts[:2] == ["access", "facial"] and len(parts) == 3 and method == "POST":
+        user = current_user(request, connection)
+        require_module(user, "access")
+        data = await body_object(request)
+        if parts[2] == "identify":
+            image = require_private_image(connection, user, data.get("imageFileId"), {"users", "access-logs"})
+            job_id = queue_notification(connection, user["condominium_id"], "biometric-identify", str(user["id"]), {"requestedBy": user["id"], "imageFileId": image["id"]})
+            audit(connection, request, user, "facial_identify_queued", "access", job_id)
+            connection.commit()
+            return {"status": "queued", "jobId": job_id, "providerStatus": "not_configured"}
+        if parts[2] == "confirm":
+            resident_id = data.get("residentId")
+            direction = data.get("direction", "entrada")
+            if not isinstance(resident_id, int) or direction not in {"entrada", "saída"}:
+                fail(422, "Informe residentId e direction válidos.")
+            target = connection.execute("SELECT * FROM usuarios WHERE id=? AND condominium_id=? AND perfil='resident' AND ativo=1", (resident_id, user["condominium_id"])).fetchone()
+            if target is None:
+                fail(404, "Morador não encontrado.")
+            access_id = save_record(connection, user, "access-logs", {"person": target["nome"], "unit": target["unidade"], "kind": "morador", "direction": direction, "registeredBy": user["nome"], "createdAt": now_iso()})
+            audit(connection, request, user, "facial_confirm", "access", access_id)
+            connection.commit()
+            return {"confirmed": True, "accessLogId": access_id}
+        fail(404, "Endpoint não encontrado.")
+
+    if parts == ["notifications", "webhooks"] or (len(parts) == 3 and parts[:2] == ["notifications", "webhooks"]):
+        if method != "POST" or len(parts) != 3:
+            fail(404, "Endpoint não encontrado.")
+        secret = os.getenv("COGEM_NOTIFICATION_WEBHOOK_SECRET")
+        if not secret:
+            fail(503, "Webhook de notificações não configurado.")
+        if not hmac.compare_digest(request.headers.get("x-cogem-webhook-secret", ""), secret):
+            fail(401, "Assinatura de webhook inválida.")
+        data = await body_object(request)
+        status = data.get("status")
+        if status not in {"sent", "delivered", "read", "failed"} or not isinstance(data.get("jobId"), int):
+            fail(422, "Informe jobId e um status válido.")
+        cursor = connection.execute("UPDATE notification_jobs SET status=?,updated_at=? WHERE id=? AND channel LIKE ?", (status, now_iso(), data["jobId"], f"%{parts[2]}%"))
+        if not cursor.rowcount:
+            fail(404, "Notificação não encontrada.")
+        connection.commit()
+        return {"updated": True, "status": status}
+
+    if parts == ["packages", "notifications", "bulk"] and method == "POST":
+        user = current_user(request, connection)
+        require_module(user, "packages")
+        if user["perfil"] == "resident":
+            fail(403, "Moradores não podem disparar notificações em massa.")
+        data = await body_object(request)
+        ids = data.get("packageIds")
+        channels = data.get("channels", ["email", "whatsapp"])
+        if not isinstance(ids, list) or not ids or not isinstance(channels, list) or any(item not in {"email", "whatsapp"} for item in channels):
+            fail(422, "Informe packageIds e channels válidos.")
+        queued = 0
+        for package_id in ids:
+            row = record_row(connection, user, "packages", package_id)
+            package = record_dict(row)
+            for channel in channels:
+                queue_notification(connection, user["condominium_id"], channel, package.get("unit", ""), {"type": "package", "packageId": package_id})
+                queued += 1
+        audit(connection, request, user, "bulk_notify", "packages", details={"packageIds": ids, "jobs": queued})
+        connection.commit()
+        return {"status": "queued", "jobs": queued}
+
+    if parts == ["vehicles", "plate-recognition"] and method == "POST":
+        user = current_user(request, connection)
+        require_module(user, "vehicles")
+        image = require_private_image(connection, user, (await body_object(request)).get("imageFileId"), {"vehicles"})
+        job_id = queue_notification(connection, user["condominium_id"], "plate-recognition", str(user["id"]), {"requestedBy": user["id"], "imageFileId": image["id"]})
+        audit(connection, request, user, "plate_recognition_queued", "vehicles", job_id)
+        connection.commit()
+        return {"status": "queued", "jobId": job_id, "providerStatus": "not_configured"}
+
+    if parts == ["vehicles", "tag", "validate"] and method == "POST":
+        user = current_user(request, connection)
+        require_module(user, "vehicles")
+        tag = (await body_object(request)).get("tag")
+        if not isinstance(tag, str) or not tag.strip():
+            fail(422, "Informe uma tag válida.")
+        vehicles = list_records(connection, user, "vehicles", {"limit": 500})
+        vehicle = next((item for item in vehicles if str(item.get("tag", "")).casefold() == tag.casefold()), None)
+        return {"valid": vehicle is not None, "vehicle": vehicle}
+
+    if len(parts) == 3 and parts[0] == "storage" and parts[2] == "download" and parts[1].isdigit() and method == "GET":
+        user = current_user(request, connection)
+        file_id = int(parts[1])
+        file_row = connection.execute("SELECT * FROM storage_files WHERE id=? AND condominium_id=?", (file_id, user["condominium_id"])).fetchone()
+        if file_row is None:
+            fail(404, "Arquivo não encontrado.")
+        module = ENTITY_MODULES.get(file_row["module"], file_row["module"])
+        require_module(user, module)
+        if user["perfil"] == "resident":
+            related = record_row(connection, user, file_row["module"], int(file_row["record_id"]))
+            if related["owner_id"] != user["id"] and related["unit_key"] != user["unidade"]:
+                fail(404, "Arquivo não encontrado.")
+        file_content = (STORAGE_DIR / file_row["stored_name"]).read_bytes()
+        if file_row["is_encrypted"]:
+            file_content = storage_cipher().decrypt(file_content)
+        audit(connection, request, user, "download", module, file_row["record_id"])
+        connection.commit()
+        safe_name = file_row["original_name"].replace('"', "_").replace("\r", "_").replace("\n", "_")
+        return Response(content=file_content, media_type=file_row["content_type"], headers={"Content-Disposition": f'attachment; filename="{safe_name}"'})
 
     if parts[0] == "packages" and len(parts) >= 2 and parts[1] == "pickup":
         token = parts[2] if len(parts) > 2 else None
@@ -286,8 +470,10 @@ async def dispatch(path: str, request: Request, connection=Depends(get_db)):
             fail(422, "Token de retirada obrigatório.")
         token_hash = hashlib.sha256(token.encode()).hexdigest()
         pickup = connection.execute("SELECT * FROM pickup_tokens WHERE token_hash=?", (token_hash,)).fetchone()
-        if pickup is None or pickup["used_at"] or pickup["expires_at"] <= now_iso():
+        if pickup is None or pickup["expires_at"] <= now_iso():
             fail(404, "Token inválido, expirado ou já utilizado.")
+        if pickup["used_at"]:
+            fail(409, "Token de retirada já utilizado.")
         row = connection.execute("SELECT * FROM api_records WHERE id=? AND condominium_id=? AND entity='packages'", (pickup["package_id"], pickup["condominium_id"])).fetchone()
         if row is None:
             fail(404, "Encomenda não encontrada.")
@@ -331,7 +517,7 @@ async def dispatch(path: str, request: Request, connection=Depends(get_db)):
             fail(422, "QR inválido.")
         rows = connection.execute("SELECT * FROM api_records WHERE condominium_id=? AND entity='visitors' ORDER BY id DESC", (user["condominium_id"],)).fetchall()
         visitor = next((record_dict(row) for row in rows if json.loads(row["payload"]).get("qrToken") == token), None)
-        if visitor is None or visitor.get("status") != "autorizado" or visitor.get("validUntil", "") < now_iso():
+        if visitor is None or visitor.get("status") != "autorizado" or parse_iso(visitor.get("validFrom")) > datetime.now(timezone.utc) or parse_iso(visitor.get("validUntil")) < datetime.now(timezone.utc):
             return {"valid": False, "authorized": False}
         return {"valid": True, "authorized": True, "visitor": visitor}
 
@@ -354,14 +540,53 @@ async def dispatch(path: str, request: Request, connection=Depends(get_db)):
     user = current_user(request, connection)
     require_module(user, module)
 
+    if user["perfil"] == "resident" and entity == "packages" and method != "GET":
+        fail(403, "Moradores não podem alterar operações de encomendas.")
+
+    if user["perfil"] == "resident" and entity in {"announcements", "polls", "assemblies"}:
+        resident_actions = {
+            "announcements": method == "GET" or (method == "POST" and len(subpath) == 2 and subpath[1] == "read"),
+            "polls": method == "GET" or (method == "POST" and len(subpath) == 2 and subpath[1] == "vote"),
+            "assemblies": method == "GET" or (method == "POST" and len(subpath) >= 2 and (subpath[1] == "presence" or (len(subpath) == 4 and subpath[1] == "agenda" and subpath[3] == "vote"))),
+        }
+        if not resident_actions[entity]:
+            fail(403, "Moradores podem apenas consultar e participar destas atividades.")
+
+    if entity == "profile" and not subpath:
+        if method == "GET":
+            return user_dict(user)
+        if method == "PATCH":
+            data = await body_object(request)
+            updates, values = [], []
+            if "name" in data:
+                updates.append("nome=?")
+                values.append(data["name"])
+            if "email" in data:
+                updates.append("email=?")
+                values.append(data["email"].strip().lower())
+            if updates:
+                try:
+                    connection.execute(f"UPDATE usuarios SET {','.join(updates)} WHERE id=?", (*values, user["id"]))
+                except sqlite3.IntegrityError:
+                    fail(409, "E-mail já cadastrado.")
+            audit(connection, request, user, "update_profile", module, user["id"])
+            connection.commit()
+            return user_dict(connection.execute("SELECT * FROM usuarios WHERE id=?", (user["id"],)).fetchone())
+
+    if entity == "audit" and not subpath and method == "GET":
+        rows = connection.execute("SELECT * FROM audit_logs WHERE condominium_id=? ORDER BY id DESC LIMIT 500", (user["condominium_id"],)).fetchall()
+        return [dict(row) for row in rows]
+
     if entity == "users":
         if not subpath and method == "GET":
             users = connection.execute("SELECT * FROM usuarios WHERE condominium_id=? ORDER BY nome", (user["condominium_id"],)).fetchall()
             return [user_dict(item) for item in users]
         if not subpath and method == "POST":
             data = await body_object(request)
-            if any(not data.get(key) for key in ("name", "email", "password", "role", "unit")) or len(data["password"]) < 8:
+            if any(not isinstance(data.get(key), str) or not data[key].strip() for key in ("name", "email", "password", "role", "unit")) or len(data.get("password", "")) < 8:
                 fail(422, "Informe nome, e-mail, senha com 8 caracteres, perfil e unidade.")
+            if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", data["email"].strip()):
+                fail(422, "E-mail inválido.")
             if data["role"] not in ROLE_MODULES or (user["perfil"] == "admin" and data["role"] in {"admin", "manager"}):
                 fail(403, "Não é permitido administrar contas de administrador da plataforma.")
             try:
@@ -405,18 +630,23 @@ async def dispatch(path: str, request: Request, connection=Depends(get_db)):
                 return user_dict(connection.execute("SELECT * FROM usuarios WHERE id=?", (user_id,)).fetchone())
             if tail == ["permissions"] and method in {"GET", "PUT"}:
                 if method == "GET":
-                    row = connection.execute("SELECT payload FROM api_records WHERE condominium_id=? AND entity='user_permissions' AND unit_key=? ORDER BY id DESC LIMIT 1", (user["condominium_id"], str(user_id))).fetchone()
-                    return json.loads(row["payload"]) if row else {"userId": user_id, "permissions": sorted(ROLE_MODULES[target["perfil"]])}
+                    permissions = json.loads(target["permissions_json"]) if target["permissions_json"] else sorted(ROLE_MODULES[target["perfil"]])
+                    return {"userId": user_id, "permissions": permissions}
                 data = await body_object(request)
                 if not isinstance(data.get("permissions"), list) or any(not isinstance(value, str) for value in data["permissions"]):
                     fail(422, "permissions deve ser uma lista de módulos.")
-                data["userId"] = user_id
-                existing = connection.execute("SELECT id FROM api_records WHERE condominium_id=? AND entity='user_permissions' AND unit_key=? ORDER BY id DESC LIMIT 1", (user["condominium_id"], str(user_id))).fetchone()
-                save_record(connection, user, "user_permissions", data, existing["id"] if existing else None)
+                baseline = ROLE_MODULES[target["perfil"]]
+                permitted = set(ENTITY_MODULES.values())
+                if any(value not in permitted for value in data["permissions"]) or ("*" not in baseline and not set(data["permissions"]).issubset(baseline)):
+                    fail(422, "Permissões não podem exceder os módulos do perfil.")
+                connection.execute("UPDATE usuarios SET permissions_json=? WHERE id=?", (json_payload(data["permissions"]), user_id))
                 audit(connection, request, user, "permissions", module, user_id)
                 connection.commit()
-                return data
+                return {"userId": user_id, "permissions": data["permissions"]}
             if tail == ["face"] and method == "DELETE":
+                files = connection.execute("SELECT stored_name FROM storage_files WHERE condominium_id=? AND module='users' AND record_id=?", (user["condominium_id"], str(user_id))).fetchall()
+                for file in files:
+                    (STORAGE_DIR / file["stored_name"]).unlink(missing_ok=True)
                 connection.execute("DELETE FROM storage_files WHERE condominium_id=? AND module='users' AND record_id=?", (user["condominium_id"], str(user_id)))
                 audit(connection, request, user, "delete_face", module, user_id)
                 connection.commit()
@@ -493,6 +723,8 @@ async def dispatch(path: str, request: Request, connection=Depends(get_db)):
             delta = amount if movement == "entrada" else -amount if movement == "saída" else None
         if not isinstance(delta, (int, float)) or delta == 0 or not data.get("reason"):
             fail(422, "Informe delta diferente de zero e reason.")
+        if isinstance(delta, bool) or not math.isfinite(float(delta)):
+            fail(422, "delta precisa ser um número finito.")
         connection.execute("BEGIN IMMEDIATE")
         row = record_row(connection, user, "inventory", item_id)
         payload = json.loads(row["payload"])
@@ -528,11 +760,20 @@ async def dispatch(path: str, request: Request, connection=Depends(get_db)):
         if poll_vote or assembly_vote:
             data = await body_object(request)
             choice = data.get("choice", data.get("option"))
+            if assembly_vote and not tail[1].isdigit():
+                fail(422, "agendaIndex deve ser numérico.")
             if payload.get("status", "open") in {"closed", "encerrada", "fechada"}:
                 fail(409, "Votação encerrada.")
             if entity == "polls" and choice not in payload.get("options", []):
                 fail(422, "Opção de voto inválida.")
-            agenda_index = int(tail[1]) if assembly_vote else 0
+            agenda_index = int(tail[1]) if assembly_vote and tail[1].isdigit() else 0
+            if assembly_vote:
+                agenda = payload.get("agenda", [])
+                if agenda_index >= len(agenda):
+                    fail(404, "Item de pauta não encontrado.")
+                choices = agenda[agenda_index].get("options", agenda[agenda_index].get("choices", []))
+                if choices and choice not in choices:
+                    fail(422, "Opção de voto inválida.")
             try:
                 connection.execute("INSERT INTO api_votes(condominium_id,vote_type,poll_id,voter_id,choice,created_at) VALUES(?,?,?,?,?,?)",
                                    (user["condominium_id"], entity, record_id * 10000 + agenda_index, user["id"], str(choice), now_iso()))
@@ -557,21 +798,27 @@ async def dispatch(path: str, request: Request, connection=Depends(get_db)):
             return presence
         if entity == "assemblies" and tail == ["quorum"] and method == "GET":
             attendees = list(payload.get("presence", {}).values())
-            return {"present": sum(1 for item in attendees if item.get("present")), "total": len(attendees)}
+            present = sum(1 for item in attendees if item.get("present"))
+            total = connection.execute("SELECT count(*) FROM usuarios WHERE condominium_id=? AND perfil='resident' AND ativo=1", (user["condominium_id"],)).fetchone()[0]
+            return {"present": present, "total": total, "percentage": round(present / total * 100, 2) if total else 0}
         if entity == "assemblies" and tail == ["minutes"] and method == "GET":
             return payload.get("minutes", {"assemblyId": record_id, "status": payload.get("status"), "votes": []})
 
     if entity == "vehicles" and subpath and subpath[0].isdigit() and subpath[1:] == ["movements"] and method == "POST":
         vehicle_id = int(subpath[0])
         data = await body_object(request)
-        direction = data.get("direction")
-        if direction not in {"entrada", "saída", "entry", "exit"}:
+        direction = str(data.get("direction", "")).strip().casefold()
+        direction_aliases = {"entrada": "entrada", "entry": "entrada", "in": "entrada", "saída": "saída", "saida": "saída", "exit": "saída", "out": "saída"}
+        if direction not in direction_aliases:
             fail(422, "direction inválida.")
+        direction = direction_aliases[direction]
+        connection.execute("BEGIN IMMEDIATE")
         row = record_row(connection, user, "vehicles", vehicle_id)
         payload = json.loads(row["payload"])
         inside = payload.get("inside", payload.get("status") == "dentro")
-        entering = direction in {"entrada", "entry"}
+        entering = direction == "entrada"
         if inside == entering:
+            connection.rollback()
             fail(409, "Veículo já está dentro." if entering else "Veículo não está dentro.")
         payload.update({"inside": entering, "status": "dentro" if entering else "fora", "lastMovementAt": now_iso()})
         movement = {"vehicleId": vehicle_id, "direction": direction, "createdAt": now_iso(), "registeredBy": user["id"]}
@@ -619,10 +866,14 @@ async def dispatch(path: str, request: Request, connection=Depends(get_db)):
         document = record_dict(record_row(connection, user, entity, int(subpath[0])))
         if not document.get("fileId"):
             fail(404, "Arquivo não encontrado.")
-        file_row = connection.execute("SELECT * FROM storage_files WHERE id=? AND condominium_id=?", (document["fileId"], user["condominium_id"])).fetchone()
+        file_row = connection.execute("SELECT * FROM storage_files WHERE id=? AND condominium_id=? AND module='documents' AND record_id=?", (document["fileId"], user["condominium_id"], str(subpath[0]))).fetchone()
         if file_row is None:
             fail(404, "Arquivo não encontrado.")
-        return FileResponse(STORAGE_DIR / file_row["stored_name"], filename=file_row["original_name"], media_type=file_row["content_type"])
+        file_path = STORAGE_DIR / file_row["stored_name"]
+        content = file_path.read_bytes()
+        if file_row["is_encrypted"]:
+            content = storage_cipher().decrypt(content)
+        return Response(content=content, media_type=file_row["content_type"], headers={"Content-Disposition": f'attachment; filename="{file_row["original_name"]}"'})
 
     if entity == "charges" and subpath and subpath[0].isdigit() and subpath[1:] in (["pix"], ["boleto"]) and method == "POST":
         charge_id = int(subpath[0])
@@ -650,6 +901,27 @@ async def dispatch(path: str, request: Request, connection=Depends(get_db)):
 
     if entity == "access-logs" and not subpath and method == "POST":
         data = await body_object(request)
+        kind = str(data.get("kind", "")).strip().casefold()
+        if kind in {"vehicle", "veiculo", "veículo", "carro", "car"}:
+            direction = data.get("direction")
+            if direction not in {"entrada", "saída", "entry", "exit", "saida"}:
+                fail(422, "Direção de movimentação de veículo inválida.")
+            entering = direction in {"entrada", "entry"}
+            plate = str(data.get("plate", data.get("person", ""))).replace("-", "").replace(" ", "").upper()
+            connection.execute("BEGIN IMMEDIATE")
+            vehicles = connection.execute("SELECT * FROM api_records WHERE condominium_id=? AND entity='vehicles'", (user["condominium_id"],)).fetchall()
+            vehicle_row = next((item for item in vehicles if str(json.loads(item["payload"]).get("plate", "")).replace("-", "").replace(" ", "").upper() == plate), None)
+            if vehicle_row is None:
+                connection.rollback()
+                fail(404, "Veículo não cadastrado.")
+            vehicle = record_dict(vehicle_row)
+            inside = vehicle.get("inside", vehicle.get("status") == "dentro")
+            if inside == entering:
+                connection.rollback()
+                fail(409, "Veículo já está dentro." if entering else "Veículo não está dentro.")
+            vehicle.update({"inside": entering, "status": "dentro" if entering else "fora", "lastMovementAt": now_iso()})
+            save_record(connection, user, "vehicles", vehicle, vehicle_row["id"])
+            save_record(connection, user, "vehicle-movements", {"vehicleId": vehicle_row["id"], "direction": "entrada" if entering else "saída", "createdAt": now_iso(), "registeredBy": user["id"]})
         record_id = save_record(connection, user, entity, data)
         audit(connection, request, user, "create", module, record_id)
         connection.commit()
@@ -661,34 +933,56 @@ async def dispatch(path: str, request: Request, connection=Depends(get_db)):
         data = await body_object(request)
         validate_payload(entity, data)
         if entity == "packages":
-            data.setdefault("status", "aguardando retirada")
+            data["status"] = "aguardando retirada"
             data["receivedAt"] = now_iso()
             data["receivedBy"] = user["nome"]
         if entity == "occurrences":
-            data.setdefault("status", "em aberto")
+            data["status"] = "em aberto"
             data.setdefault("type", "comum")
             data["reporter"] = user["nome"]
         if entity == "visitors":
-            data.setdefault("status", "autorizado")
+            data["status"] = "autorizado"
             data["qrToken"] = secrets.token_urlsafe(24)
         if entity == "events":
-            data.setdefault("status", "confirmada")
+            data["status"] = "confirmada"
             connection.execute("BEGIN IMMEDIATE")
             existing = list_records(connection, user, entity, {"limit": 500})
-            conflict = any(item.get("space") == data["space"] and item.get("status", "confirmada") == "confirmada" and item.get("startsAt", "") < data["endsAt"] and item.get("endsAt", "") > data["startsAt"] for item in existing)
+            conflict = any(item.get("space") == data["space"] and item.get("status", "confirmada") == "confirmada" and parse_iso(item["startsAt"]) < parse_iso(data["endsAt"]) and parse_iso(item["endsAt"]) > parse_iso(data["startsAt"]) for item in existing)
             if conflict:
                 connection.rollback()
                 fail(409, "Já existe uma reserva nesse espaço e horário.")
         if entity == "polls":
-            data.setdefault("status", "open")
-            data.setdefault("votes", {})
+            data["status"] = "open"
+            data["votes"] = {}
         if entity == "vehicles":
-            data.setdefault("inside", False)
-            data.setdefault("status", "fora")
+            connection.execute("BEGIN IMMEDIATE")
+            vehicles = list_records(connection, user, "vehicles", {"limit": 500})
+            if any(str(item.get("plate", "")).replace("-", "").upper() == str(data["plate"]).replace("-", "").upper() for item in vehicles):
+                connection.rollback()
+                fail(409, "Placa já cadastrada.")
+            data["inside"] = False
+            data["status"] = "fora"
         if entity == "inventory":
+            connection.execute("BEGIN IMMEDIATE")
+            items = list_records(connection, user, "inventory", {"limit": 500})
+            if any(str(item.get("sku", "")).casefold() == str(data["sku"]).casefold() for item in items):
+                connection.rollback()
+                fail(409, "SKU já cadastrado.")
             data.setdefault("minimum", 0)
+        if entity == "keys":
+            connection.execute("BEGIN IMMEDIATE")
+            keys = list_records(connection, user, "keys", {"limit": 500})
+            if any(str(item.get("code", "")).casefold() == str(data["code"]).casefold() for item in keys):
+                connection.rollback()
+                fail(409, "Código de chave já cadastrado.")
+            data["status"] = "disponível"
         if entity == "charges":
-            data.setdefault("status", "pending")
+            data["status"] = "pending"
+        if entity == "work-orders":
+            data["status"] = "open"
+        if entity == "documents" and user["perfil"] == "maintenance":
+            data["visibility"] = "technical"
+            data["category"] = "technical"
         record_id = save_record(connection, user, entity, data)
         pickup_token = None
         if entity == "packages":
@@ -714,6 +1008,8 @@ async def dispatch(path: str, request: Request, connection=Depends(get_db)):
             connection.commit()
             return current["versions"][-1]
         if tail == ["visibility"] and entity == "documents" and method == "PATCH":
+            if user["perfil"] == "maintenance":
+                fail(403, "Somente gestores podem alterar a visibilidade de documentos.")
             data = await body_object(request)
             if "visibility" not in data:
                 fail(422, "Informe visibility.")
@@ -724,13 +1020,20 @@ async def dispatch(path: str, request: Request, connection=Depends(get_db)):
             connection.commit()
             return current
         if (tail == ["entry"] and entity == "visitors" and method == "PATCH") or (tail == ["exit"] and entity == "visitors" and method == "PATCH"):
-            visitor = record_dict(row)
+            connection.execute("BEGIN IMMEDIATE")
+            current = record_row(connection, user, entity, record_id)
+            visitor = record_dict(current)
             entering = tail == ["entry"]
             if entering and visitor.get("status") != "autorizado":
+                connection.rollback()
                 fail(409, "Visitante não está autorizado para entrada.")
             if not entering and visitor.get("status") != "dentro":
+                connection.rollback()
                 fail(409, "Visitante não está registrado dentro.")
             moment = now_iso()
+            if entering and (parse_iso(visitor["validFrom"]) > datetime.now(timezone.utc) or parse_iso(visitor["validUntil"]) < datetime.now(timezone.utc)):
+                connection.rollback()
+                fail(409, "A autorização está fora do período de validade.")
             visitor.update({"status": "dentro" if entering else "finalizado", "enteredAt": moment if entering else visitor.get("enteredAt"), "exitedAt": None if entering else moment})
             save_record(connection, user, entity, visitor, record_id)
             save_record(connection, user, "access-logs", {"person": visitor.get("name"), "unit": visitor.get("unit"), "kind": visitor.get("type"), "direction": "entrada" if entering else "saída", "authorizedBy": visitor.get("resident"), "registeredBy": user["nome"]})
@@ -738,10 +1041,12 @@ async def dispatch(path: str, request: Request, connection=Depends(get_db)):
             connection.commit()
             return visitor
         if (tail == ["checkout"] and entity == "keys" and method == "PATCH") or (tail == ["return"] and entity == "keys" and method == "PATCH"):
-            current = record_dict(row)
+            connection.execute("BEGIN IMMEDIATE")
+            current = record_dict(record_row(connection, user, entity, record_id))
             checkout = tail == ["checkout"]
             invalid_state = current.get("status", "disponível") != "disponível" if checkout else current.get("status") != "retirada"
             if invalid_state:
+                connection.rollback()
                 fail(409, "Estado da chave não permite essa operação.")
             data = await body_object(request, required=checkout)
             current.update({"status": "retirada" if checkout else "disponível", "holder": data.get("holder", "") if checkout else "", "purpose": data.get("purpose", "") if checkout else "", "checkedOutAt": now_iso() if checkout else None, "expectedReturn": data.get("expectedReturn") if checkout else None})
@@ -750,10 +1055,19 @@ async def dispatch(path: str, request: Request, connection=Depends(get_db)):
             connection.commit()
             return current
         if tail == ["status"] and method == "PATCH" and entity in {"occurrences", "moves"}:
+            if user["perfil"] == "resident":
+                fail(403, "Moradores não podem alterar o status.")
             data = await body_object(request)
             current = record_dict(row)
             if not data.get("status"):
                 fail(422, "Informe status.")
+            if entity == "occurrences":
+                transitions = {
+                    "comum": {"em aberto": {"em andamento"}, "em andamento": {"concluída", "incompleta"}, "incompleta": {"em andamento"}, "concluída": set()},
+                    "urgente": {"em aberto": {"em andamento"}, "em andamento": {"resolvida"}, "resolvida": set()},
+                }
+                if data["status"] not in transitions.get(current.get("type", "comum"), {}).get(current.get("status", "em aberto"), set()):
+                    fail(409, "Transição de status inválida.")
             current.update({"status": data["status"], "updatedAt": now_iso()})
             save_record(connection, user, entity, current, record_id)
             audit(connection, request, user, "status", module, record_id)
@@ -763,9 +1077,27 @@ async def dispatch(path: str, request: Request, connection=Depends(get_db)):
             return record_dict(row)
         if not tail and method == "PATCH":
             data = await body_object(request)
+            if user["perfil"] == "resident" and "status" in data:
+                fail(403, "Moradores não podem alterar o status da ocorrência.")
+            protected_fields = {
+                "occurrences": {"status"}, "packages": {"status", "deliveredAt", "deliveredTo"},
+                "inventory": {"quantity"}, "keys": {"status", "holder", "checkedOutAt"},
+                "visitors": {"status", "enteredAt", "exitedAt"}, "vehicles": {"status", "inside"},
+                "polls": {"status", "votes"}, "assemblies": {"status", "votes", "presence"},
+                "work-orders": {"status"}, "charges": {"status", "paidAt"}, "events": {"status"},
+            }
+            if protected_fields.get(entity, set()).intersection(data):
+                fail(422, "Use o endpoint de operação dedicado para alterar o estado deste registro.")
             current = record_dict(row)
             current.update(data)
             validate_payload(entity, current)
+            if entity == "events":
+                connection.execute("BEGIN IMMEDIATE")
+                events = list_records(connection, user, "events", {"limit": 500})
+                conflict = any(item["id"] != record_id and item.get("space") == current["space"] and item.get("status", "confirmada") == "confirmada" and parse_iso(item["startsAt"]) < parse_iso(current["endsAt"]) and parse_iso(item["endsAt"]) > parse_iso(current["startsAt"]) for item in events)
+                if conflict:
+                    connection.rollback()
+                    fail(409, "Já existe uma reserva nesse espaço e horário.")
             save_record(connection, user, entity, current, record_id)
             audit(connection, request, user, "update", module, record_id)
             connection.commit()
@@ -775,26 +1107,44 @@ async def dispatch(path: str, request: Request, connection=Depends(get_db)):
 
 
 async def save_upload(request, connection, user, module, record_id, biometric=False):
-    if biometric and not os.getenv("COGEM_BIOMETRIC_STORAGE_KEY"):
-        fail(503, "Armazenamento biométrico criptografado não configurado.")
-    content_type = request.headers.get("content-type", "application/octet-stream").split(";", 1)[0]
-    body = await request.body()
+    cipher = storage_cipher()
+    request_type = request.headers.get("content-type", "application/octet-stream")
+    if request_type.startswith("multipart/form-data"):
+        form = await request.form()
+        uploaded = form.get("file")
+        if uploaded is None or not hasattr(uploaded, "read"):
+            fail(422, "Envie o arquivo no campo 'file'.")
+        body = await uploaded.read(MAX_UPLOAD_BYTES + 1)
+        content_type = uploaded.content_type or "application/octet-stream"
+        name = uploaded.filename or "upload"
+    else:
+        body = await read_limited_body(request, MAX_UPLOAD_BYTES, "Arquivo maior que 10 MB.")
+        content_type = request_type.split(";", 1)[0]
+        name = request.headers.get("x-file-name", "upload")
     if not body or len(body) > MAX_UPLOAD_BYTES:
         fail(413, "Arquivo vazio ou maior que 10 MB.")
     if not (content_type.startswith("image/") or content_type == "application/pdf"):
         fail(415, "Tipo de arquivo não permitido.")
-    name = request.headers.get("x-file-name", "upload")
+    if biometric and not content_type.startswith("image/"):
+        fail(415, "Biometria deve ser enviada como imagem.")
     suffix = Path(name).suffix[:12]
     stored_name = f"{secrets.token_urlsafe(24)}{suffix}"
     STORAGE_DIR.mkdir(parents=True, exist_ok=True)
-    (STORAGE_DIR / stored_name).write_bytes(body)
+    encrypted_body = cipher.encrypt(body)
+    (STORAGE_DIR / stored_name).write_bytes(encrypted_body)
     cursor = connection.execute("""INSERT INTO storage_files(condominium_id,owner_id,module,record_id,original_name,stored_name,content_type,size_bytes,created_at)
                                   VALUES(?,?,?,?,?,?,?,?,?)""",
                                (user["condominium_id"], user["id"], module, str(record_id), Path(name).name, stored_name, content_type, len(body), now_iso()))
-    if module in {"documents", "work-orders"}:
+    if module in {"documents", "work-orders", "packages", "occurrences", "vehicles", "access-logs"}:
         row = record_row(connection, user, module, record_id)
         payload = record_dict(row)
         payload.setdefault("attachments", []).append({"fileId": cursor.lastrowid, "name": Path(name).name, "contentType": content_type, "size": len(body)})
+        if module == "documents" and not payload.get("fileId"):
+            payload["fileId"] = cursor.lastrowid
         save_record(connection, user, module, payload, record_id)
+    if content_type.startswith("image/"):
+        channel = "biometric-processing" if biometric else "image-processing"
+        queue_notification(connection, user["condominium_id"], channel, str(cursor.lastrowid), {"fileId": cursor.lastrowid, "module": module, "recordId": record_id})
+    audit(connection, request, user, "upload", module, record_id, details={"fileId": cursor.lastrowid, "bytes": len(body), "encrypted": True})
     connection.commit()
     return {"id": cursor.lastrowid, "name": Path(name).name, "status": "stored"}

@@ -9,6 +9,7 @@ DB_PATH = database_dir / "cogem.db"
 def get_db():
     conexao = sqlite3.connect(DB_PATH)
     conexao.row_factory = sqlite3.Row
+    conexao.execute("PRAGMA foreign_keys = ON")
 
     try:
         yield conexao

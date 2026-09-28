@@ -13,7 +13,10 @@ def criar_tabelas(conexao):
     titulo TEXT NOT NULL DEFAULT '',
     responsavel TEXT NOT NULL DEFAULT 'Não atribuído',
     status TEXT NOT NULL DEFAULT "em aberto",
-    tipo TEXT NOT NULL DEFAULT "comum"
+    tipo TEXT NOT NULL DEFAULT "comum",
+    condominium_id TEXT NOT NULL DEFAULT 'cogem',
+    unit_key TEXT,
+    owner_id INTEGER
     )""")
 
     cursor.execute("""
@@ -239,6 +242,9 @@ def criar_tabelas(conexao):
     payload TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'queued',
     attempts INTEGER NOT NULL DEFAULT 0,
+    locked_by TEXT,
+    locked_until TEXT,
+    last_error TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
     )""")
@@ -254,6 +260,7 @@ def criar_tabelas(conexao):
     stored_name TEXT NOT NULL UNIQUE,
     content_type TEXT NOT NULL,
     size_bytes INTEGER NOT NULL,
+    is_encrypted INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     FOREIGN KEY (owner_id) REFERENCES usuarios(id)
     )""")
@@ -261,6 +268,15 @@ def criar_tabelas(conexao):
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_api_records_scope ON api_records(condominium_id, entity, unit_key)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_logs_scope ON audit_logs(condominium_id, occurred_at)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_notification_jobs_status ON notification_jobs(status, created_at)")
+
+    job_columns = {column[1] for column in cursor.execute("PRAGMA table_info(notification_jobs)")}
+    for column, definition in {
+        "locked_by": "TEXT",
+        "locked_until": "TEXT",
+        "last_error": "TEXT",
+    }.items():
+        if column not in job_columns:
+            cursor.execute(f"ALTER TABLE notification_jobs ADD COLUMN {column} {definition}")
 
     vote_columns = {column[1] for column in cursor.execute("PRAGMA table_info(api_votes)")}
     if "vote_type" not in vote_columns:
@@ -270,6 +286,12 @@ def criar_tabelas(conexao):
     user_columns = {column[1] for column in cursor.execute("PRAGMA table_info(usuarios)")}
     if "condominium_id" not in user_columns:
         cursor.execute("ALTER TABLE usuarios ADD COLUMN condominium_id TEXT NOT NULL DEFAULT 'cogem'")
+    if "permissions_json" not in user_columns:
+        cursor.execute("ALTER TABLE usuarios ADD COLUMN permissions_json TEXT")
+
+    file_columns = {column[1] for column in cursor.execute("PRAGMA table_info(storage_files)")}
+    if "is_encrypted" not in file_columns:
+        cursor.execute("ALTER TABLE storage_files ADD COLUMN is_encrypted INTEGER NOT NULL DEFAULT 0")
 
     colunas = {coluna[1] for coluna in cursor.execute("PRAGMA table_info(ocorrencias)")}
     novas_colunas = {
@@ -281,6 +303,15 @@ def criar_tabelas(conexao):
     for coluna, definicao in novas_colunas.items():
         if coluna not in colunas:
             cursor.execute(f"ALTER TABLE ocorrencias ADD COLUMN {coluna} {definicao}")
+
+    occurrence_columns = {column[1] for column in cursor.execute("PRAGMA table_info(ocorrencias)")}
+    for column, definition in {
+        "condominium_id": "TEXT NOT NULL DEFAULT 'cogem'",
+        "unit_key": "TEXT",
+        "owner_id": "INTEGER",
+    }.items():
+        if column not in occurrence_columns:
+            cursor.execute(f"ALTER TABLE ocorrencias ADD COLUMN {column} {definition}")
 
     cursor.execute(
         """
